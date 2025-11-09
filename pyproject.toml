@@ -18,7 +18,10 @@ keywords = [
     "cell-interactions",
     "interscellar-volumes",
     "bioinformatics",
-    "computational-biology"
+    "computational-biology",
+    "visualization",
+    "napari",
+    "3d-visualization"
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -59,6 +62,10 @@ all = [
     "anndata>=0.8.0",
     "duckdb>=0.6.0",
 ]
+
+[project.scripts]
+visualize-all-3d = "visualization.visualize_all_3d:main"
+visualize-pair-3d = "visualization.visualize_pair_3d:main"
 
 [project.urls]
 Homepage = "https://github.com/eunicelee153/InterSCellar"
