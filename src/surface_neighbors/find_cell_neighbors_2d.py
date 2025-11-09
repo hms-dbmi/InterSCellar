@@ -206,3 +206,160 @@ def find_touching_neighbors_2d(global_mask: np.ndarray, all_bboxes: dict, n_jobs
     print(f"Found {len(touching_pairs)} touching neighbor pairs")
     return touching_pairs
 
+## Surface-to-surface distance computation
+
+def compute_surface_to_surface_distance_2d(
+    global_mask: np.ndarray, 
+    cell_a_id: int, 
+    cell_b_id: int, 
+    pixel_size_um: float,
+    max_distance_um: float = float('inf')
+) -> float:
+    mask_a = (global_mask == cell_a_id)
+    mask_b = (global_mask == cell_b_id)
+    
+    if not mask_a.any() or not mask_b.any():
+        return float('inf')
+    
+    structure = generate_binary_structure(2, 2)
+    surface_a = mask_a & ~binary_erosion(mask_a, structure=structure)
+    surface_b = mask_b & ~binary_erosion(mask_b, structure=structure)
+    
+    if not surface_a.any() or not surface_b.any():
+        return float('inf')
+    
+    bbox_with_halo = compute_bounding_box_with_halo_2d(surface_a, max_distance_um, pixel_size_um)
+    
+    if bbox_with_halo is None:
+        return float('inf')
+    
+    slice_y, slice_x = bbox_with_halo
+    surface_a_crop = surface_a[slice_y, slice_x]
+    surface_b_crop = surface_b[slice_y, slice_x]
+    
+    if not surface_b_crop.any():
+        return float('inf')
+    
+    dist_transform_crop = distance_transform_edt(~surface_a_crop, sampling=pixel_size_um) # EDT from surface A
+    
+    min_distance = dist_transform_crop[surface_b_crop].min()
+    
+    return min_distance
+
+def compute_surface_distances_batch_2d(
+    global_surface: np.ndarray,
+    cell_pairs: List[Tuple[int, int]],
+    pixel_size_um: float,
+    max_distance_um: float,
+    cells_df: pd.DataFrame,
+    global_mask: np.ndarray,
+    all_bboxes_with_halo: Dict[int, Tuple[slice, slice]],
+    n_jobs: int = 1
+) -> List[Dict[str, Any]]:
+    from collections import defaultdict
+    from joblib import Parallel, delayed
+    
+    print("VECTORIZED APPROACH: Computing surface distances using global EDTs for unique crop regions...")
+    print(f"Processing {len(cell_pairs)} cell pairs with max_distance_um = {max_distance_um}")
+    
+    print("Step 1: Identifying unique crop regions...")
+    unique_crops = set()
+    cell_to_crop_tuple = {}
+    
+    for cell_a_id, cell_b_id in cell_pairs:
+        if cell_a_id in all_bboxes_with_halo:
+            crop_slice = all_bboxes_with_halo[cell_a_id]
+            crop_tuple = (crop_slice[0].start, crop_slice[0].stop, 
+                         crop_slice[1].start, crop_slice[1].stop)
+            unique_crops.add(crop_tuple)
+            cell_to_crop_tuple[cell_a_id] = crop_tuple
+    
+    total_cells = len(set(pair[0] for pair in cell_pairs if pair[0] in all_bboxes_with_halo))
+    print(f"Found {len(unique_crops)} unique crop regions")
+    
+    print(f"Step 2: Computing EDTs for {len(unique_crops)} unique crop regions...")
+    crop_edts = {}
+    
+    def compute_crop_edt(crop_tuple):
+        y_start, y_stop, x_start, x_stop = crop_tuple
+        crop_slice = (slice(y_start, y_stop), slice(x_start, x_stop))
+        
+        mask_crop = global_mask[crop_slice]
+        global_surface_crop = global_surface[crop_slice]
+
+        return crop_tuple, None, mask_crop, global_surface_crop
+    
+    if n_jobs == 1:
+        # Sequential crop data extraction
+        pbar = tqdm(unique_crops, desc="Extracting crop regions", 
+                   unit="crops", ncols=100, leave=True, mininterval=0.1, maxinterval=1.0)
+        for crop_tuple in pbar:
+            crop_tuple, _, mask_crop, global_surface_crop = compute_crop_edt(crop_tuple)
+            crop_edts[crop_tuple] = {
+                'mask_crop': mask_crop,
+                'global_surface_crop': global_surface_crop
+            }
+    else:
+        # Parallel crop data extraction
+        print(f"Extracting crop regions with {n_jobs} parallel jobs...")
+        pbar = tqdm(unique_crops, desc="Extracting crop regions in parallel", 
+                   unit="crops", ncols=100, leave=True, mininterval=0.1, maxinterval=1.0)
+        results_list = Parallel(n_jobs=n_jobs)(
+            delayed(compute_crop_edt)(crop_tuple) 
+            for crop_tuple in pbar
+        )
+        
+        for crop_tuple, _, mask_crop, global_surface_crop in results_list:
+            crop_edts[crop_tuple] = {
+                'mask_crop': mask_crop,
+                'global_surface_crop': global_surface_crop
+            }
+    
+    print(f"Completed crop region extraction for all {len(crop_edts)} unique crop regions")
+    
+    print("Step 3: Computing surface-to-surface distances for all cell pairs...")
+    results = []
+    cell_type_map = dict(zip(cells_df['cell_id'], cells_df['cell_type']))
+    
+    pbar = tqdm(cell_pairs, desc="Computing surface-to-surface distances", 
+               unit="pairs", ncols=100, leave=True, mininterval=0.1, maxinterval=1.0)
+    
+    for cell_a_id, cell_b_id in pbar:
+        if cell_a_id not in cell_to_crop_tuple:
+            continue
+            
+        crop_tuple = cell_to_crop_tuple[cell_a_id]
+        crop_data = crop_edts[crop_tuple]
+        
+        mask_crop = crop_data['mask_crop']
+        global_surface_crop = crop_data['global_surface_crop']
+        
+        surface_a_indices = (mask_crop == cell_a_id) & global_surface_crop
+        surface_b_indices = (mask_crop == cell_b_id) & global_surface_crop
+        
+        if surface_a_indices.any() and surface_b_indices.any():
+            surface_a_mask = (mask_crop == cell_a_id)
+            structure = generate_binary_structure(2, 2)  # 8-connectivity
+            surface_a_only = surface_a_mask & ~binary_erosion(surface_a_mask, structure=structure)
+            
+            dist_transform = distance_transform_edt(~surface_a_only, sampling=pixel_size_um)
+            
+            min_distance = dist_transform[surface_b_indices].min()
+            
+            if min_distance <= max_distance_um:
+                results.append({
+                    'cell_id_a': cell_a_id,
+                    'cell_id_b': cell_b_id,
+                    'cell_type_a': cell_type_map.get(cell_a_id, 'Unknown'),
+                    'cell_type_b': cell_type_map.get(cell_b_id, 'Unknown'),
+                    'surface_distance_um': min_distance
+                })
+        
+        if pbar.n % 1000 == 0:
+            pbar.refresh()
+    
+    print(f"Found {len(results)} near-neighbor pairs within {max_distance_um} μm")
+    return results
+
+## Graph database
+
