@@ -1,0 +1,76 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "InterSCellar"
+version = "0.1.0"
+description = "Surface-based Cell Neighbor Detection and Interscellar Volume Computation for 2D & 3D Spatial Omics"
+readme = "README.md"
+requires-python = ">=3.7"
+license = {text = "MIT"}
+authors = [
+    {name = "Eunice Yewon Lee", email = "yl888@duke.edu"}
+]
+keywords = [
+    "spatial-transcriptomics",
+    "cell-neighbors",
+    "cell-interactions",
+    "interscellar-volumes",
+    "bioinformatics",
+    "computational-biology"
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+
+dependencies = [
+    "numpy>=1.20.0",
+    "pandas>=1.3.0",
+    "scipy>=1.7.0",
+    "tqdm>=4.62.0",
+    "opencv-python>=4.5.0",
+    "dask[array]>=2021.0.0",
+    "matplotlib>=3.4.0",
+    "scikit-image>=0.18.0",
+    "seaborn>=0.11.0",
+    "napari>=0.4.0",
+    "zarr>=2.10.0",
+]
+
+[project.optional-dependencies]
+anndata = [
+    "anndata>=0.8.0",
+]
+duckdb = [
+    "duckdb>=0.6.0",
+]
+all = [
+    "anndata>=0.8.0",
+    "duckdb>=0.6.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/eunicelee153/InterSCellar"
+Repository = "https://github.com/eunicelee153/InterSCellar"
+Issues = "https://github.com/eunicelee153/InterSCellar/issues"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"*" = ["*.py", "*.md", "LICENSE"]
+
