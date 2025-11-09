@@ -1473,3 +1473,419 @@ def create_global_cell_only_volumes_zarr(
     
     return cell_only_volumes
 
+## Graph database
+
+def create_interscellar_volume_database(db_path: str = 'interscellar_volumes.db') -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    
+    cursor.execute("DROP TABLE IF EXISTS interscellar_volumes")
+    cursor.execute("DROP TABLE IF EXISTS cells")
+    
+    # Cell table
+    cursor.execute("""
+    CREATE TABLE cells (
+        cell_id INTEGER PRIMARY KEY,
+        cell_type TEXT,
+        centroid_x REAL,
+        centroid_y REAL,
+        centroid_z REAL
+    )
+    """)
+    
+    # Interscellar Volume table
+    cursor.execute("""
+    CREATE TABLE interscellar_volumes (
+        pair_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        cell_a_id INTEGER,
+        cell_b_id INTEGER,
+        cell_a_type TEXT,
+        cell_b_type TEXT,
+        -- Comprehensive interscellar volume
+        total_interscellar_volume_um3 REAL,
+        total_interscellar_volume_voxels INTEGER,
+        -- Component breakdown
+        edt_volume_um3 REAL,
+        edt_volume_voxels INTEGER,
+        intracellular_volume_um3 REAL,
+        intracellular_volume_voxels INTEGER,
+        touching_surface_area_um2 REAL,
+        touching_surface_area_voxels INTEGER,
+        -- Distance statistics
+        mean_distance_um REAL,
+        max_distance_um REAL,
+        num_components INTEGER,
+        largest_component_volume_um3 REAL,
+        voxel_volume_um3 REAL,
+        -- Parameters used
+        max_distance_threshold_um REAL,
+        intracellular_threshold_um REAL,
+        FOREIGN KEY(cell_a_id) REFERENCES cells(cell_id),
+        FOREIGN KEY(cell_b_id) REFERENCES cells(cell_id),
+        UNIQUE(cell_a_id, cell_b_id)
+    )
+    """)
+    
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_cells_cell_type ON cells(cell_type)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_cells_centroid ON cells(centroid_x, centroid_y, centroid_z)")
+    
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_interscellar_cell_a ON interscellar_volumes(cell_a_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_interscellar_cell_b ON interscellar_volumes(cell_b_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_interscellar_cell_types ON interscellar_volumes(cell_a_type, cell_b_type)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_interscellar_volume ON interscellar_volumes(total_interscellar_volume_um3)")
+    
+    conn.commit()
+    return conn
+
+def populate_cells_table(conn: sqlite3.Connection, metadata_df: pd.DataFrame, 
+                        cell_id: str = 'CellID', 
+                        cell_type: str = 'phenotype',
+                        centroid_x: str = 'X_centroid',
+                        centroid_y: str = 'Y_centroid', 
+                        centroid_z: str = 'Z_centroid') -> None:
+    required_cols = [cell_id, cell_type, centroid_x, centroid_y, centroid_z]
+    missing_cols = [col for col in required_cols if col not in metadata_df.columns]
+    if missing_cols:
+        raise ValueError(f"Missing required columns in metadata: {missing_cols}")
+    
+    cells_data = metadata_df[[cell_id, cell_type, centroid_x, centroid_y, centroid_z]].copy()
+    cells_data.columns = ['cell_id', 'cell_type', 'centroid_x', 'centroid_y', 'centroid_z']
+    cells_data.to_sql('cells', conn, if_exists='replace', index=False)
+    print(f"Populated cells table with {len(cells_data)} cells")
+
+def get_cells_dataframe(conn: sqlite3.Connection) -> pd.DataFrame:
+    return pd.read_sql_query("SELECT * FROM cells", conn)
+
+def export_interscellar_volumes_to_csv(conn: sqlite3.Connection, output_file: str = 'interscellar_volumes.csv') -> None:
+    df_volumes = pd.read_sql_query("SELECT * FROM interscellar_volumes", conn)
+    df_volumes.to_csv(output_file, index=False)
+    print(f"Interscellar volumes table saved as '{output_file}'")
+
+def export_interscellar_volumes_to_duckdb(conn: sqlite3.Connection, output_file: str = 'interscellar_volumes.duckdb') -> None:
+    try:
+        import duckdb
+    except ImportError:
+        print("Error: DuckDB not available. Install with: pip install duckdb")
+        return
+    
+    print(f"Exporting interscellar volumes to DuckDB: {output_file}")
+    
+    try:
+        df_cells = pd.read_sql_query("SELECT * FROM cells", conn)
+        print(f"  - {len(df_cells)} cells (nodes)")
+    except Exception as e:
+        print(f"Warning: Could not load cells table: {e}")
+        df_cells = pd.DataFrame()
+    
+    df_volumes = pd.read_sql_query("SELECT * FROM interscellar_volumes", conn)
+    print(f"  - {len(df_volumes)} volume pairs")
+    
+    if df_volumes.empty:
+        print("Warning: No volume data to export")
+        return
+    
+    duckdb_conn = duckdb.connect(output_file)
+    
+    if not df_cells.empty:
+        duckdb_conn.execute("""
+            CREATE TABLE cells (
+                cell_id INTEGER PRIMARY KEY,
+                cell_type VARCHAR,
+                centroid_x DOUBLE,
+                centroid_y DOUBLE,
+                centroid_z DOUBLE
+            )
+        """)
+        duckdb_conn.register('df_cells', df_cells)
+        duckdb_conn.execute("INSERT INTO cells SELECT * FROM df_cells")
+    
+    duckdb_conn.execute("""
+        CREATE TABLE interscellar_volumes (
+            pair_id INTEGER PRIMARY KEY,
+            cell_a_id INTEGER,
+            cell_b_id INTEGER,
+            cell_a_type VARCHAR,
+            cell_b_type VARCHAR,
+            total_interscellar_volume_um3 DOUBLE,
+            total_interscellar_volume_voxels INTEGER,
+            edt_volume_um3 DOUBLE,
+            edt_volume_voxels INTEGER,
+            intracellular_volume_um3 DOUBLE,
+            intracellular_volume_voxels INTEGER,
+            touching_surface_area_um2 DOUBLE,
+            touching_surface_area_voxels INTEGER,
+            mean_distance_um DOUBLE,
+            max_distance_um DOUBLE,
+            num_components INTEGER,
+            largest_component_volume_um3 DOUBLE,
+            voxel_volume_um3 DOUBLE,
+            max_distance_threshold_um DOUBLE,
+            intracellular_threshold_um DOUBLE
+        )
+    """)
+    
+    duckdb_conn.register('df_volumes', df_volumes)
+    duckdb_conn.execute("INSERT INTO interscellar_volumes SELECT * FROM df_volumes")
+    
+    print("Creating analytical views for volume analysis...")
+    
+    duckdb_conn.execute("""
+        CREATE VIEW cell_type_volume_statistics AS
+        SELECT 
+            cell_a_type,
+            cell_b_type,
+            COUNT(*) as pair_count,
+            AVG(total_interscellar_volume_um3) as mean_volume,
+            MIN(total_interscellar_volume_um3) as min_volume,
+            MAX(total_interscellar_volume_um3) as max_volume,
+            SUM(total_interscellar_volume_um3) as total_volume,
+            AVG(mean_distance_um) as mean_distance,
+            AVG(num_components) as mean_components
+        FROM interscellar_volumes
+        GROUP BY cell_a_type, cell_b_type
+        ORDER BY pair_count DESC
+    """)
+    
+    duckdb_conn.execute("""
+        CREATE VIEW volume_distribution AS
+        SELECT 
+            pair_id,
+            cell_a_id,
+            cell_b_id,
+            cell_a_type,
+            cell_b_type,
+            total_interscellar_volume_um3,
+            edt_volume_um3,
+            intracellular_volume_um3,
+            touching_surface_area_um2,
+            mean_distance_um,
+            max_distance_um,
+            num_components,
+            (edt_volume_um3 / NULLIF(total_interscellar_volume_um3, 0)) * 100 as edt_percentage,
+            (intracellular_volume_um3 / NULLIF(total_interscellar_volume_um3, 0)) * 100 as intracellular_percentage,
+            (touching_surface_area_um2 / NULLIF(total_interscellar_volume_um3, 0)) * 100 as surface_percentage
+        FROM interscellar_volumes
+    """)
+    
+    duckdb_conn.execute("""
+        CREATE VIEW high_volume_interactions AS
+        SELECT 
+            pair_id,
+            cell_a_id,
+            cell_b_id,
+            cell_a_type,
+            cell_b_type,
+            total_interscellar_volume_um3,
+            mean_distance_um,
+            num_components
+        FROM interscellar_volumes
+        WHERE total_interscellar_volume_um3 > (
+            SELECT AVG(total_interscellar_volume_um3) + 2 * STDDEV(total_interscellar_volume_um3)
+            FROM interscellar_volumes
+        )
+        ORDER BY total_interscellar_volume_um3 DESC
+    """)
+    
+    duckdb_conn.execute("""
+        CREATE TABLE metadata (
+            key VARCHAR,
+            value VARCHAR
+        )
+    """)
+    
+    metadata = [
+        ('total_volume_pairs', str(len(df_volumes))),
+        ('total_cells', str(len(df_cells)) if not df_cells.empty else '0'),
+        ('unique_cell_types', str(df_volumes['cell_a_type'].nunique() + df_volumes['cell_b_type'].nunique()) if not df_volumes.empty else '0'),
+        ('export_timestamp', pd.Timestamp.now().isoformat()),
+        ('database_type', 'interscellar_volumes'),
+        ('format', 'duckdb')
+    ]
+    
+    for key, value in metadata:
+        duckdb_conn.execute("INSERT INTO metadata VALUES (?, ?)", [key, value])
+    
+    duckdb_conn.close()
+    
+    print(f"DuckDB export completed: {output_file}")
+    print(f"  - {len(df_volumes)} volume pairs")
+    if not df_cells.empty:
+        print(f"  - {len(df_cells)} cells (nodes)")
+    print(f"  - Analytical views created for volume analysis")
+    print(f"  - Metadata table populated")
+    
+    # Print example queries
+    print("\nExample DuckDB queries:")
+    print("1. Cell type volume stats: SELECT * FROM cell_type_volume_statistics")
+    print("2. Volume distribution: SELECT * FROM volume_distribution LIMIT 10")
+    print("3. High volume interactions: SELECT * FROM high_volume_interactions LIMIT 10")
+    print("4. Metadata: SELECT * FROM metadata")
+
+def get_anndata_from_interscellar_database(conn: sqlite3.Connection):
+    if not ANNDATA_AVAILABLE:
+        print("Warning: AnnData not available. Install with: pip install anndata")
+        return None
+    
+    try:
+        import anndata as ad
+        from scipy.sparse import csr_matrix
+    except ImportError:
+        print("Warning: AnnData or scipy.sparse not available. Install with: pip install anndata scipy")
+        return None
+    
+    try:
+        df_cells = pd.read_sql_query("SELECT * FROM cells", conn)
+        df_cells.set_index('cell_id', inplace=True)
+    except Exception:
+        print("  No cells table found, creating from interscellar volumes...")
+        df_volumes = pd.read_sql_query("SELECT * FROM interscellar_volumes", conn)
+        
+        all_cells = set(df_volumes['cell_a_id'].unique()) | set(df_volumes['cell_b_id'].unique())
+        
+        df_cells = pd.DataFrame({
+            'cell_id': list(all_cells),
+            'cell_type': ['unknown'] * len(all_cells),  # Placeholder
+            'centroid_x': [0.0] * len(all_cells),
+            'centroid_y': [0.0] * len(all_cells),
+            'centroid_z': [0.0] * len(all_cells)
+        })
+        df_cells.set_index('cell_id', inplace=True)
+    
+    df_volumes = pd.read_sql_query("SELECT * FROM interscellar_volumes", conn)
+    
+    if df_volumes.empty:
+        print("Warning: No interscellar volumes found in database")
+        return None
+    
+    n_cells = len(df_cells)
+    adjacency_matrix = np.zeros((n_cells, n_cells), dtype=np.float32)
+    
+    cell_id_to_idx = {cell_id: idx for idx, cell_id in enumerate(df_cells.index)}
+    
+    for _, row in df_volumes.iterrows():
+        idx_a = cell_id_to_idx.get(row['cell_a_id'])
+        idx_b = cell_id_to_idx.get(row['cell_b_id'])
+        if idx_a is not None and idx_b is not None:
+            volume = float(row['total_interscellar_volume_um3'])
+            adjacency_matrix[idx_a, idx_b] = volume
+            adjacency_matrix[idx_b, idx_a] = volume
+    
+    sparse_adjacency = csr_matrix(adjacency_matrix)
+    
+    edt_matrix = np.zeros((n_cells, n_cells), dtype=np.float32)
+    intracellular_matrix = np.zeros((n_cells, n_cells), dtype=np.float32)
+    touching_matrix = np.zeros((n_cells, n_cells), dtype=np.float32)
+    
+    for _, row in df_volumes.iterrows():
+        idx_a = cell_id_to_idx.get(row['cell_a_id'])
+        idx_b = cell_id_to_idx.get(row['cell_b_id'])
+        if idx_a is not None and idx_b is not None:
+            edt_matrix[idx_a, idx_b] = float(row.get('edt_volume_um3', 0.0))
+            edt_matrix[idx_b, idx_a] = edt_matrix[idx_a, idx_b]
+            
+            intracellular_matrix[idx_a, idx_b] = float(row.get('intracellular_volume_um3', 0.0))
+            intracellular_matrix[idx_b, idx_a] = intracellular_matrix[idx_a, idx_b]
+            
+            touching_matrix[idx_a, idx_b] = float(row.get('touching_surface_area_um2', 0.0))
+            touching_matrix[idx_b, idx_a] = touching_matrix[idx_a, idx_b]
+    
+    adata = ad.AnnData(
+        X=sparse_adjacency,  # Weighted adjacency matrix (total interscellar volumes)
+        obs=df_cells,  # Cell metadata
+        var=df_cells.copy(),  # Same metadata for variables
+        obsp={'spatial_connectivities': sparse_adjacency}  # Store in obsp
+    )
+    
+    adata.layers['edt_volume'] = csr_matrix(edt_matrix)
+    adata.layers['intracellular_volume'] = csr_matrix(intracellular_matrix)
+    adata.layers['touching_surface_area'] = csr_matrix(touching_matrix)
+    
+    max_dist_thresh = df_volumes['max_distance_threshold_um'].iloc[0] if len(df_volumes) > 0 else None
+    intra_thresh = df_volumes['intracellular_threshold_um'].iloc[0] if len(df_volumes) > 0 else None
+    
+    volume_info = {
+        'total_pairs': int(len(df_volumes)),
+        'total_cells': int(n_cells),
+        'graph_type': 'undirected_weighted',
+        'edge_weights': 'total_interscellar_volume_um3',
+    }
+    
+    if max_dist_thresh is not None:
+        volume_info['max_distance_threshold_um'] = float(max_dist_thresh)
+    if intra_thresh is not None:
+        volume_info['intracellular_threshold_um'] = float(intra_thresh)
+    
+    if len(df_volumes) > 0:
+        volume_info['mean_volume_um3'] = float(df_volumes['total_interscellar_volume_um3'].mean())
+        volume_info['total_volume_um3'] = float(df_volumes['total_interscellar_volume_um3'].sum())
+    else:
+        volume_info['mean_volume_um3'] = 0.0
+        volume_info['total_volume_um3'] = 0.0
+    
+    adata.uns['interscellar_volume_info'] = volume_info
+    
+    volume_records = df_volumes.to_dict('records')
+    serializable_records = []
+    for record in volume_records:
+        serializable_record = {}
+        for key, value in record.items():
+            if hasattr(value, 'item'):  # numpy scalar
+                serializable_record[key] = value.item()
+            elif pd.isna(value):  # pandas NA
+                serializable_record[key] = None
+            elif isinstance(value, (np.integer, np.floating)):
+                serializable_record[key] = float(value) if isinstance(value, np.floating) else int(value)
+            elif isinstance(value, (list, dict, tuple)):
+                serializable_record[key] = str(value)
+            elif not isinstance(value, (str, int, float, bool, type(None))):
+                serializable_record[key] = str(value)
+            else:
+                serializable_record[key] = value
+        serializable_records.append(serializable_record)
+    
+    if len(serializable_records) <= 1000:
+        adata.uns['interscellar_volumes'] = serializable_records
+    else:
+        adata.uns['interscellar_volumes_count'] = len(serializable_records)
+        adata.uns['interscellar_volumes_note'] = 'Full volume records available in database and CSV files'
+    
+    return adata
+
+def export_interscellar_volumes_to_anndata(
+    conn: sqlite3.Connection, 
+    output_file: str = 'interscellar_volumes.h5ad'
+):
+    if not ANNDATA_AVAILABLE:
+        print("Warning: AnnData not available. Install with: pip install anndata")
+        return None
+    
+    adata = get_anndata_from_interscellar_database(conn)
+    
+    if adata is None:
+        return None
+    
+    try:
+        print(f"Writing AnnData to file: {output_file}")
+        adata.write(output_file)
+        
+        import os
+        if not os.path.exists(output_file):
+            raise RuntimeError(f"AnnData file was not created: {output_file}")
+        
+        file_size = os.path.getsize(output_file)
+        if file_size == 0:
+            raise RuntimeError(f"AnnData file was created but is empty: {output_file}")
+        
+        print(f"AnnData object saved to '{output_file}' ({file_size:,} bytes)")
+        print(f"  - {adata.n_obs} cells")
+        print(f"  - {len(adata.uns.get('interscellar_volumes', []))} volume pairs")
+        print(f"  - Weighted adjacency matrix shape: {adata.X.shape}")
+        print(f"  - Component volumes stored in layers: edt_volume, intracellular_volume, touching_surface_area")
+        return adata
+    except Exception as e:
+        import traceback
+        print(f"Error saving AnnData file: {e}")
+        print(f"Other outputs (CSV, DB, Zarr) still available")
+        traceback.print_exc()
+        return None
+
