@@ -1889,7 +1889,154 @@ def export_interscellar_volumes_to_anndata(
         traceback.print_exc()
         return None
 
-## Utility
+def build_interscellar_volume_database_from_neighbors(
+    mask_3d: np.ndarray,
+    neighbor_pairs_csv: str,
+    global_surface_pickle: str,
+    halo_bboxes_pickle: str,
+    voxel_size_um: tuple = (0.56, 0.28, 0.28),
+    db_path: str = 'interscellar_volumes.db',
+    output_csv: str = None,
+    output_anndata: str = None,
+    output_mesh_zarr: str = None,
+    max_distance_um: float = 3.0,
+    intracellular_threshold_um: float = 1.0,
+    n_jobs: int = 4,
+    intermediate_results_dir: str = "intermediate_interscellar_results"
+) -> sqlite3.Connection:
+    print(f"Building interscellar volume database from pre-computed neighbor pairs")
+    print(f"Voxel size: {voxel_size_um} μm")
+    
+    neighbor_pairs_df = load_neighbor_pairs_from_csv(neighbor_pairs_csv)
+    
+    global_surface = load_global_surface_from_pickle(global_surface_pickle)
+    halo_bboxes = load_halo_bboxes_from_pickle(halo_bboxes_pickle)
+    
+    conn = create_interscellar_volume_database(db_path)
+    
+    print("Computing interscellar volumes for all neighbor pairs...")
+    volume_results = compute_interscellar_volumes_for_neighbor_pairs(
+        mask_3d, neighbor_pairs_df, voxel_size_um, global_surface, halo_bboxes,
+        max_distance_um, intracellular_threshold_um, n_jobs, intermediate_results_dir,
+        output_mesh_zarr=output_mesh_zarr
+    )
+    
+    if volume_results:
+        cursor = conn.cursor()
+        volume_data = []
+        for result in volume_results:
+            volume_data.append((
+                result['cell_a_id'], 
+                result['cell_b_id'], 
+                result['cell_a_type'], 
+                result['cell_b_type'],
+                # Interscellar volume
+                result['total_interscellar_volume_um3'],
+                result['total_interscellar_volume_voxels'],
+                # Volume components
+                result['edt_volume_um3'],
+                result['edt_volume_voxels'],
+                result['intracellular_volume_um3'],
+                result['intracellular_volume_voxels'],
+                result['touching_surface_area_um2'],
+                result['touching_surface_area_voxels'],
+                # Distance statistics
+                result['mean_distance_um'],
+                result['max_distance_um'],
+                result['num_components'],
+                result['largest_component_volume_um3'],
+                result['voxel_volume_um3'],
+                # Parameters used
+                result['max_distance_threshold_um'],
+                result['intracellular_threshold_um']
+            ))
+        
+        try:
+            cursor.executemany(
+                """INSERT INTO interscellar_volumes 
+                   (cell_a_id, cell_b_id, cell_a_type, cell_b_type, 
+                    total_interscellar_volume_um3, total_interscellar_volume_voxels,
+                    edt_volume_um3, edt_volume_voxels, intracellular_volume_um3, intracellular_volume_voxels,
+                    touching_surface_area_um2, touching_surface_area_voxels,
+                    mean_distance_um, max_distance_um, num_components,
+                    largest_component_volume_um3, voxel_volume_um3,
+                    max_distance_threshold_um, intracellular_threshold_um) 
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", 
+                volume_data
+            )
+            conn.commit()
+            print(f"Successfully inserted {len(volume_results)} interscellar volume records into database")
+        except sqlite3.IntegrityError as e:
+            if "UNIQUE constraint failed" in str(e):
+                print(f"Warning: Some duplicate pairs were found and skipped due to UNIQUE constraint")
+                inserted_count = 0
+                for data in volume_data:
+                    try:
+                        cursor.execute(
+                            """INSERT INTO interscellar_volumes 
+                               (cell_a_id, cell_b_id, cell_a_type, cell_b_type, 
+                                total_interscellar_volume_um3, total_interscellar_volume_voxels,
+                                edt_volume_um3, edt_volume_voxels, intracellular_volume_um3, intracellular_volume_voxels,
+                                touching_surface_area_um2, touching_surface_area_voxels,
+                                mean_distance_um, max_distance_um, num_components,
+                                largest_component_volume_um3, voxel_volume_um3,
+                                max_distance_threshold_um, intracellular_threshold_um) 
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", 
+                            data
+                        )
+                        inserted_count += 1
+                    except sqlite3.IntegrityError:
+                        continue
+                conn.commit()
+                print(f"Successfully inserted {inserted_count} unique interscellar volume records into database")
+            else:
+                raise e
+    else:
+        print("No interscellar volumes found")
+    
+    # Export to CSV
+    if output_csv:
+        export_interscellar_volumes_to_csv(conn, output_csv)
+    
+    # Export to AnnData
+    if output_anndata:
+        print(f"\nExporting to AnnData format: {output_anndata}")
+        try:
+            result = export_interscellar_volumes_to_anndata(conn, output_anndata)
+            if result is not None:
+                print(f"AnnData export completed successfully")
+            else:
+                print(f"Warning: AnnData export returned None (may have failed silently)")
+                print(f"Check error messages above for details.")
+                print(f"Other outputs (CSV, DB, Zarr) are still available.")
+        except Exception as e:
+            print(f"Warning: AnnData export failed (non-fatal): {e}")
+            print(f"Error type: {type(e).__name__}")
+            print(f"Other outputs (CSV, DB, Zarr) are still available.")
+            print(f"AnnData can be created using: python wrapper/recreate_anndata.py")
+            import traceback
+            traceback.print_exc()
+    
+    if output_mesh_zarr:
+        import zarr
+        if os.path.exists(output_mesh_zarr) and os.path.isdir(output_mesh_zarr):
+            zarr_group = zarr.open(output_mesh_zarr, mode='r')
+            final_pairs = zarr_group.attrs.get('num_pairs', 0)
+            zarr_shape = zarr_group['interscellar_meshes'].shape
+            print(f"Final mesh zarr complete:")
+            print(f"Shape: {zarr_shape}")
+            print(f"Total pairs: {final_pairs}")
+            print(f"Unique pair IDs range from 1 to {np.asarray(zarr_group['interscellar_meshes']).max()}")
+        else:
+            has_masks = any('interscellar_mask' in r for r in volume_results)
+            if has_masks:
+                create_global_interscellar_mesh_zarr(
+                    volume_results, mask_3d, output_mesh_zarr, voxel_size_um
+                )
+            else:
+                print(f"Warning: Mesh zarr not created. Results don't contain masks.")
+    
+    return conn, volume_results
 
 def save_surfaces_to_pickle(surfaces: Dict[int, np.ndarray], filepath: str = "cell_surfaces.pkl") -> None:
     with open(filepath, "wb") as f:
@@ -1901,4 +2048,3 @@ def load_surfaces_from_pickle(filepath: str = "cell_surfaces.pkl") -> Dict[int, 
         surfaces = pickle.load(f)
     print(f"Loaded surfaces for {len(surfaces)} cells from pickle file: {filepath}")
     return surfaces
-    
