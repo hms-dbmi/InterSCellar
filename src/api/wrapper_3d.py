@@ -6,11 +6,10 @@ from typing import Optional, Tuple, List, Dict, Any
 from tqdm import tqdm
 import time
 import sqlite3
+import os
 
-from find_cell_neighbors_3d import(
-    create_neighbor_edge_table_database_optimized,
-    find_all_neighbors_by_surface_distance_optimized,
-    create_neighbor_edge_table_optimized,
+from ..core.find_cell_neighbors_3d import(
+    create_neighbor_edge_table_database_3d,
     get_anndata_from_database,
     query_cell_type_pairs,
     get_graph_statistics,
@@ -20,7 +19,7 @@ from find_cell_neighbors_3d import(
     load_graph_state_from_pickle
 )
 
-from compute_interscellar_volumes_3d import(
+from ..core.compute_interscellar_volumes_3d import(
     build_interscellar_volume_database_from_neighbors,
     create_global_interscellar_mesh_zarr,
     create_global_cell_only_volumes_zarr,
@@ -75,6 +74,16 @@ def find_cell_neighbors_3d(
     step1_time = time.time() - step1_start
     print(f"Step 1 completed in {step1_time:.2f} seconds")
     
+    if save_surfaces_pickle is None:
+        base_name = os.path.splitext(db_path)[0]
+        save_surfaces_pickle = f"{base_name}_surfaces.pkl"
+        print(f"Surfaces pickle path: {save_surfaces_pickle}")
+    
+    if save_graph_state_pickle is None:
+        base_name = os.path.splitext(db_path)[0]
+        save_graph_state_pickle = f"{base_name}_graph_state.pkl"
+        print(f"Graph state pickle path: {save_graph_state_pickle}")
+    
     print(f"\n2. Building neighbor graph...")
     print(f"Parameters: max_distance={max_distance_um}μm, n_jobs={n_jobs}")
     if max_distance_um == 0.0:
@@ -85,7 +94,7 @@ def find_cell_neighbors_3d(
     step2_start = time.time()
     
     try:
-        conn = create_neighbor_edge_table_database_optimized(
+        conn = create_neighbor_edge_table_database_3d(
             ome_zarr_path=ome_zarr_path,
             metadata_df=metadata_df,
             max_distance_um=max_distance_um,
@@ -105,11 +114,8 @@ def find_cell_neighbors_3d(
             save_graph_state_pickle=save_graph_state_pickle
         )
         
-        if save_surfaces_pickle:
-            print(f"Saving global surface to: {save_surfaces_pickle}")
-        
-        if save_graph_state_pickle:
-            print(f"Saving graph state to: {save_graph_state_pickle}")
+        print(f"Saving global surface to: {save_surfaces_pickle}")
+        print(f"Saving graph state to: {save_graph_state_pickle}")
         
         step2_time = time.time() - step2_start
         print(f"Neighbor graph created successfully")
@@ -167,8 +173,9 @@ def find_cell_neighbors_3d(
 def compute_interscellar_volumes_3d(
     ome_zarr_path: str,
     neighbor_pairs_csv: str,
-    global_surface_pickle: str,
-    halo_bboxes_pickle: str,
+    global_surface_pickle: Optional[str] = None,
+    halo_bboxes_pickle: Optional[str] = None,
+    neighbor_db_path: Optional[str] = None,
     voxel_size_um: tuple = (0.56, 0.28, 0.28),
     db_path: str = 'interscellar_volumes.db',
     output_csv: Optional[str] = None,
@@ -188,21 +195,41 @@ def compute_interscellar_volumes_3d(
     
     overall_start_time = time.time()
     
-    import os
+    if global_surface_pickle is None or halo_bboxes_pickle is None:
+        if neighbor_db_path:
+            base_name = os.path.splitext(neighbor_db_path)[0]
+            if global_surface_pickle is None:
+                global_surface_pickle = f"{base_name}_surfaces.pkl"
+            if halo_bboxes_pickle is None:
+                halo_bboxes_pickle = f"{base_name}_graph_state.pkl"
+        else:
+            csv_dir = os.path.dirname(neighbor_pairs_csv) if os.path.dirname(neighbor_pairs_csv) else "."
+            csv_basename = os.path.basename(neighbor_pairs_csv)
+            base_name = csv_basename.replace("_neighbors.csv", "").replace("neighbors.csv", "").replace(".csv", "")
+            base_name = os.path.join(csv_dir, base_name)
+            
+            if global_surface_pickle is None:
+                global_surface_pickle = f"{base_name}_surfaces.pkl"
+            if halo_bboxes_pickle is None:
+                halo_bboxes_pickle = f"{base_name}_graph_state.pkl"
+    
     if output_mesh_zarr is None:
         base_name = os.path.splitext(db_path)[0]
         output_mesh_zarr = f"{base_name}_interscellar_volumes.zarr"
-        print(f"Auto-setting output_mesh_zarr: {output_mesh_zarr}")
     
     if output_cell_only_zarr is None:
         base_name = os.path.splitext(db_path)[0]
         output_cell_only_zarr = f"{base_name}_cell_only_volumes.zarr"
-        print(f"Auto-setting output_cell_only_zarr: {output_cell_only_zarr}")
     
     print(f"\n1. Validating input files...")
     step1_start = time.time()
     
-    required_files = [ome_zarr_path, neighbor_pairs_csv, global_surface_pickle, halo_bboxes_pickle]
+    required_files = [ome_zarr_path, neighbor_pairs_csv]
+    if global_surface_pickle:
+        required_files.append(global_surface_pickle)
+    if halo_bboxes_pickle:
+        required_files.append(halo_bboxes_pickle)
+    
     for file_path in required_files:
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"Required file not found: {file_path}")

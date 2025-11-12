@@ -36,13 +36,13 @@ def main():
     parser.add_argument(
         '--cell-only-zarr',
         type=str,
-        default='melanoma_cell_only_volumes.zarr',
+        required=True,
         help='Path to cell-only volumes zarr file'
     )
     parser.add_argument(
         '--interscellar-zarr',
         type=str,
-        default='melanoma_interscellar_volumes.zarr',
+        required=True,
         help='Path to interscellar volumes zarr file'
     )
     parser.add_argument(

@@ -69,15 +69,15 @@ def main():
     
     p = argparse.ArgumentParser(description="Visualize one interscellar pair in napari")
     p.add_argument("--pair-id", type=int, required=True, help="Pair ID to visualize")
-    p.add_argument("--mesh-zarr", default="melanoma_interscellar_volumes.zarr",
+    p.add_argument("--mesh-zarr", required=True,
                    help="Path to interscellar mesh zarr (contains 'interscellar_meshes')")
-    p.add_argument("--seg-zarr", default="data/3d_melanoma/melanoma_mask.zarr",
+    p.add_argument("--seg-zarr", required=True,
                    help="Path to segmentation labels zarr")
-    p.add_argument("--db", default="melanoma_interscellar_volumes.db",
+    p.add_argument("--db", required=True,
                    help="SQLite DB with interscellar_volumes table (to map pair->cell IDs)")
     p.add_argument("--pair-opacity", type=float, default=0.6, help="Opacity for the interscellar volume layer")
     p.add_argument("--cells-opacity", type=float, default=0.7, help="Opacity for the cell-only layers")
-    p.add_argument("--halo-bboxes-pickle", default="melanoma_halo_bboxes_optimized.pkl",
+    p.add_argument("--halo-bboxes-pickle", required=True,
                    help="Path to pickle file with halo bounding boxes from find_cell_neighbors_3d.py")
     args = p.parse_args()
 

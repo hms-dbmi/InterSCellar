@@ -7,7 +7,7 @@ from tqdm import tqdm
 import time
 import os
 
-from find_all_neighbors_2d import (
+from ..core.find_cell_neighbors_2d import (
     create_neighbor_edge_table_database_2d,
     find_all_neighbors_by_surface_distance_2d,
     get_cells_dataframe,
@@ -17,10 +17,6 @@ from find_all_neighbors_2d import (
     export_graph_tables,
     build_global_mask_2d,
     build_global_mask_2d_with_mapping
-)
-from compute_interscellar_areas_2d import (
-    build_interscellar_area_database_from_neighbors_2d,
-    export_interscellar_areas_to_csv_2d
 )
 
 try:
