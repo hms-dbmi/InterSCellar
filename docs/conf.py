@@ -55,6 +55,17 @@ html_theme = 'sphinx_book_theme'
 html_static_path = ['_static']
 html_baseurl = os.environ.get('SPHINX_HTML_BASEURL', 'https://euniceyl.github.io/InterSCellar/')
 
+# Customize the title (change this to your desired text)
+html_title = "InterSCellar"
+
+# Option 1: Add a logo (uncomment and set path if you have a logo)
+# html_logo = "images/logo.png"  # Path relative to _static or docs directory
+# html_logo = "_static/logo.png"  # If logo is in _static folder
+
+# Option 2: Use a different title format
+# html_title = "InterSCellar Documentation"
+# html_title = "InterSCellar - Cell Interaction Analysis"
+
 # Theme options
 html_theme_options = {
     "repository_url": "https://github.com/euniceyl/InterSCellar",
@@ -62,6 +73,8 @@ html_theme_options = {
     "use_edit_page_button": True,
     "show_navbar_depth": 2,
     "show_toc_level": 2,
+    # Hide the version in the title if you want
+    # "navbar_title": "InterSCellar",  # Custom navbar title
 }
 
 # Autodoc settings

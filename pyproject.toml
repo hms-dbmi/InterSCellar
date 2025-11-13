@@ -78,10 +78,8 @@ Repository = "https://github.com/eunicelee153/InterSCellar"
 Issues = "https://github.com/eunicelee153/InterSCellar/issues"
 
 [tool.setuptools]
-package-dir = {"" = "src"}
-
-[tool.setuptools.packages.find]
-where = ["src"]
+package-dir = {"interscellar" = "src"}
+packages = ["interscellar", "interscellar.api", "interscellar.core", "interscellar.visualization"]
 
 [tool.setuptools.package-data]
 "*" = ["*.py", "*.md", "LICENSE"]
