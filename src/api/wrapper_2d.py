@@ -27,7 +27,7 @@ except ImportError:
 
 # API: Wrapper functions
 
-def find_all_neighbors_2d(
+def find_cell_neighbors_2d(
     polygon_json_path: str,
     metadata_csv_path: str,
     max_distance_um: float = 1.0,
