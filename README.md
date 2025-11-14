@@ -4,8 +4,6 @@
 
 **InterSCellar** is a Python package for surface-Based cell neighborhood and interaction volume analysis in 3D spatial omics.
 
-Input/Output/Functionalities
-
 ![Package workflow](https://raw.githubusercontent.com/euniceyl/InterSCellar/main/docs/images/package_workflow.jpeg)
 
 ## Installation
@@ -35,8 +33,9 @@ neighbors_3d, adata, conn = interscellar.find_cell_neighbors_3d(
 )
 ```
 
-**(2) Interscellar & Cell-Only Volume Computation**
+**(2) Interscellar Volume Computation**
 ```sh
+# Interscellar volumes
 volumes_3d, adata, conn = interscellar.compute_interscellar_volumes_3d(
     ome_zarr_path="data/segmentation.zarr",
     neighbor_pairs_csv="results/neighbors_3d.csv",
@@ -49,6 +48,7 @@ volumes_3d, adata, conn = interscellar.compute_interscellar_volumes_3d(
 ```
 
 ```sh
+# Cell-only volumes
 cellonly_3d = interscellar.compute_cell_only_volumes_3d(
     ome_zarr_path="data/segmentation.zarr",
     interscellar_volumes_zarr="results/interscellar_volumes.zarr"
@@ -72,6 +72,7 @@ neighbors_2d, adata, conn = interscellar.find_cell_neighbors_2d(
 
 **Volume Visualization**
 ```sh
+# Full dataset (Napari)
 visualize-all-3d \
   --cell-only-zarr "results/cell_only_volumes.zarr" \
   --interscellar-zarr "results/interscellar_volumes.zarr" \
@@ -80,6 +81,7 @@ visualize-all-3d \
 ```
 
 ```sh
+# Single pair (Napari)
 visualize-pair-3d \
   --pair-id 123 \
   --cell-only-zarr "results/cell_only_volumes.zarr" \
