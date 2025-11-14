@@ -551,14 +551,12 @@ def compute_cell_only_volumes_3d(
     if not os.path.exists(interscellar_volumes_zarr):
         raise FileNotFoundError(f"Interscellar volumes zarr not found: {interscellar_volumes_zarr}")
     
-    # Auto-detect voxel_size_um from interscellar volumes zarr
     try:
         interscellar_zarr = zarr.open(interscellar_volumes_zarr, mode='r')
         if 'voxel_size_um' in interscellar_zarr.attrs:
             voxel_size_um = tuple(interscellar_zarr.attrs['voxel_size_um'])
             print(f"Detected voxel_size_um from interscellar zarr: {voxel_size_um}")
         else:
-            # Fallback to default
             voxel_size_um = (0.56, 0.28, 0.28)
             print(f"Warning: voxel_size_um not found in zarr attributes, using default: {voxel_size_um}")
         del interscellar_zarr
@@ -572,7 +570,7 @@ def compute_cell_only_volumes_3d(
     print(f"Output zarr: {output_zarr_path}")
     
     try:
-        create_global_cell_only_volumes_zarr(
+        cell_only_mask = create_global_cell_only_volumes_zarr(
             original_segmentation_zarr=ome_zarr_path,
             interscellar_volumes_zarr=interscellar_volumes_zarr,
             output_zarr_path=output_zarr_path
@@ -584,34 +582,14 @@ def compute_cell_only_volumes_3d(
         raise
     
     print(f"\nComputing cell-only volume measurements...")
-    cell_only_zarr = zarr.open(output_zarr_path, mode='r')
-    
-    data_key = None
-    if 'labels' in cell_only_zarr:
-        data_key = 'labels'
-    elif '0' in cell_only_zarr:
-        data_key = '0'
-    else:
-        for key in cell_only_zarr.keys():
-            if hasattr(cell_only_zarr[key], 'ndim') and cell_only_zarr[key].ndim >= 3:
-                data_key = key
-                break
-    
-    if data_key is None:
-        raise ValueError(f"Could not find 3D data in cell-only zarr: {output_zarr_path}")
-    
-    cell_only_data = cell_only_zarr[data_key]
-    if cell_only_data.ndim == 5:
-        cell_only_mask = np.asarray(cell_only_data[0, 0])
-    elif cell_only_data.ndim == 3:
-        cell_only_mask = np.asarray(cell_only_data)
-    else:
-        raise ValueError(f"Unexpected dimensions in cell-only zarr: {cell_only_data.ndim}")
-    
     voxel_volume_um3 = np.prod(voxel_size_um)
     
-    unique_cells = np.unique(cell_only_mask)
-    unique_cells = unique_cells[unique_cells > 0]
+    print(f"Computing volumes for all cells...")
+    unique_cells, counts = np.unique(cell_only_mask, return_counts=True)
+
+    mask = unique_cells > 0
+    unique_cells = unique_cells[mask]
+    counts = counts[mask]
     
     print(f"Found {len(unique_cells)} cells in cell-only volumes")
     
@@ -631,21 +609,16 @@ def compute_cell_only_volumes_3d(
         except Exception as e:
             print(f"Warning: Could not access neighbor database: {e}")
     
-    volume_data = []
-    for cell_id in unique_cells:
-        cell_mask = (cell_only_mask == cell_id)
-        volume_voxels = cell_mask.sum()
-        volume_um3 = volume_voxels * voxel_volume_um3
-        
-        volume_data.append({
-            'cell_id': int(cell_id),
-            'cell_only_volume_um3': float(volume_um3),
-            'cell_only_volume_voxels': int(volume_voxels),
-            'cell_type': cell_types.get(int(cell_id), 'unknown')
-        })
+    volume_voxels_array = counts
+    volume_um3_array = volume_voxels_array * voxel_volume_um3
     
-    cell_only_df = pd.DataFrame(volume_data)
-    cell_only_df = cell_only_df.sort_values('cell_id')
+    cell_only_df = pd.DataFrame({
+        'cell_id': unique_cells.astype(int),
+        'cell_only_volume_voxels': volume_voxels_array.astype(int),
+        'cell_only_volume_um3': volume_um3_array.astype(float),
+        'cell_type': [cell_types.get(int(cid), 'unknown') for cid in unique_cells]
+    })
+    cell_only_df = cell_only_df.sort_values('cell_id').reset_index(drop=True)
     
     print(f"Computed cell-only volumes for {len(cell_only_df)} cells")
     print(f"Total cell-only volume: {cell_only_df['cell_only_volume_um3'].sum():.2f} μm³")
