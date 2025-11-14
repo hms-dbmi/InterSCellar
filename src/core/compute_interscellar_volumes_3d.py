@@ -678,7 +678,8 @@ def compute_interscellar_volumes_for_all_pairs(
     
     print(f"Computed interscellar volumes for {len(all_results)} total cell neighbor pairs")
     
-    _cleanup_intermediate_results(intermediate_results_dir)
+    # Note: Cleanup is deferred until after all steps complete (handled in wrapper)
+    # This allows resuming if the job fails later
     
     return all_results
 
@@ -1828,21 +1829,35 @@ def get_anndata_from_interscellar_database(conn: sqlite3.Connection):
     
     try:
         df_cells = pd.read_sql_query("SELECT * FROM cells", conn)
+        if df_cells.empty:
+            raise ValueError("Cells table is empty")
         df_cells.set_index('cell_id', inplace=True)
-    except Exception:
-        print("  No cells table found, creating from interscellar volumes...")
+    except Exception as e:
+        print(f" No cells table found or empty ({e}), creating from interscellar volumes...")
         df_volumes = pd.read_sql_query("SELECT * FROM interscellar_volumes", conn)
+        
+        if df_volumes.empty:
+            print("Warning: No interscellar volumes found in database")
+            return None
         
         all_cells = set(df_volumes['cell_a_id'].unique()) | set(df_volumes['cell_b_id'].unique())
         
+        cell_types = {}
+        for _, row in df_volumes.iterrows():
+            if pd.notna(row.get('cell_a_type')):
+                cell_types[row['cell_a_id']] = row['cell_a_type']
+            if pd.notna(row.get('cell_b_type')):
+                cell_types[row['cell_b_id']] = row['cell_b_type']
+        
         df_cells = pd.DataFrame({
             'cell_id': list(all_cells),
-            'cell_type': ['unknown'] * len(all_cells),  # Placeholder
+            'cell_type': [cell_types.get(cid, 'unknown') for cid in all_cells],
             'centroid_x': [0.0] * len(all_cells),
             'centroid_y': [0.0] * len(all_cells),
             'centroid_z': [0.0] * len(all_cells)
         })
         df_cells.set_index('cell_id', inplace=True)
+        print(f"  Created cells dataframe with {len(df_cells)} cells from volume data")
     
     df_volumes = pd.read_sql_query("SELECT * FROM interscellar_volumes", conn)
     
@@ -1924,7 +1939,7 @@ def get_anndata_from_interscellar_database(conn: sqlite3.Connection):
         for key, value in record.items():
             if hasattr(value, 'item'):  # numpy scalar
                 serializable_record[key] = value.item()
-            elif pd.isna(value):  # pandas NA
+            elif pd.isna(value): 
                 serializable_record[key] = None
             elif isinstance(value, (np.integer, np.floating)):
                 serializable_record[key] = float(value) if isinstance(value, np.floating) else int(value)
@@ -2020,6 +2035,56 @@ def build_interscellar_volume_database_from_neighbors(
     halo_bboxes = load_halo_bboxes_from_pickle(halo_bboxes_pickle)
     
     conn = create_interscellar_volume_database(db_path)
+    
+    # Populate cells table from neighbor database if available
+    if neighbor_db_path and os.path.exists(neighbor_db_path):
+        try:
+            import sqlite3 as sqlite3_neighbor
+            neighbor_conn = sqlite3_neighbor.connect(neighbor_db_path)
+            try:
+                neighbor_cells = pd.read_sql_query("SELECT * FROM cells", neighbor_conn)
+                if not neighbor_cells.empty:
+                    # Ensure column names match
+                    if 'cell_id' not in neighbor_cells.columns and 'CellID' in neighbor_cells.columns:
+                        neighbor_cells = neighbor_cells.rename(columns={'CellID': 'cell_id'})
+                    if 'cell_id' in neighbor_cells.columns:
+                        neighbor_cells[['cell_id', 'cell_type', 'centroid_x', 'centroid_y', 'centroid_z']].to_sql(
+                            'cells', conn, if_exists='replace', index=False
+                        )
+                        print(f"Populated cells table with {len(neighbor_cells)} cells from neighbor database")
+            except Exception as e:
+                print(f"Warning: Could not load cells from neighbor database: {e}")
+            finally:
+                neighbor_conn.close()
+        except Exception as e:
+            print(f"Warning: Could not access neighbor database for cells: {e}")
+    
+    # If cells table is still empty, create from volume pairs
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM cells")
+    if cursor.fetchone()[0] == 0:
+        print("  Creating cells table from volume pairs...")
+        all_cells = set(neighbor_pairs_df['cell_a_id'].unique()) | set(neighbor_pairs_df['cell_b_id'].unique())
+        cell_types = {}
+        for _, row in neighbor_pairs_df.iterrows():
+            if pd.notna(row.get('cell_a_type')):
+                cell_types[row['cell_a_id']] = row['cell_a_type']
+            if pd.notna(row.get('cell_b_type')):
+                cell_types[row['cell_b_id']] = row['cell_b_type']
+        
+        cells_data = []
+        for cell_id in all_cells:
+            cells_data.append((
+                int(cell_id),
+                cell_types.get(cell_id, 'unknown'),
+                0.0, 0.0, 0.0  # Placeholder centroids
+            ))
+        cursor.executemany(
+            "INSERT INTO cells (cell_id, cell_type, centroid_x, centroid_y, centroid_z) VALUES (?, ?, ?, ?, ?)",
+            cells_data
+        )
+        conn.commit()
+        print(f"Created cells table with {len(cells_data)} cells from neighbor pairs")
     
     print("Computing interscellar volumes for all neighbor pairs...")
     volume_results = compute_interscellar_volumes_for_neighbor_pairs(

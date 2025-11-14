@@ -73,9 +73,9 @@ visualize-all-3d = "visualization.visualize_all_3d:main"
 visualize-pair-3d = "visualization.visualize_pair_3d:main"
 
 [project.urls]
-Homepage = "https://github.com/eunicelee153/InterSCellar"
-Repository = "https://github.com/eunicelee153/InterSCellar"
-Issues = "https://github.com/eunicelee153/InterSCellar/issues"
+Homepage = "https://github.com/euniceyl/InterSCellar"
+Repository = "https://github.com/euniceyl/InterSCellar"
+Issues = "https://github.com/euniceyl/InterSCellar/issues"
 
 [tool.setuptools]
 package-dir = {"interscellar" = "src"}

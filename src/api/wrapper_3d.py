@@ -303,17 +303,15 @@ def compute_interscellar_volumes_3d(
     print(f"\n1. Validating input files...")
     step1_start = time.time()
     
-    # Validate required files
     required_files = [ome_zarr_path]
     
-    # Either neighbor_pairs_csv OR neighbor_db_path must be provided
     if not neighbor_pairs_csv and not neighbor_db_path:
         raise ValueError("Must provide either neighbor_pairs_csv or neighbor_db_path")
     
     if neighbor_pairs_csv and not os.path.exists(neighbor_pairs_csv):
         if neighbor_db_path and os.path.exists(neighbor_db_path):
             print(f"Warning: neighbor_pairs_csv not found: {neighbor_pairs_csv}")
-            print(f"Will use database instead: {neighbor_db_path}")
+            print(f"Use db instead: {neighbor_db_path}")
         else:
             raise FileNotFoundError(f"neighbor_pairs_csv not found: {neighbor_pairs_csv}")
     elif neighbor_pairs_csv:
@@ -322,7 +320,7 @@ def compute_interscellar_volumes_3d(
     if neighbor_db_path and not os.path.exists(neighbor_db_path):
         if neighbor_pairs_csv and os.path.exists(neighbor_pairs_csv):
             print(f"Warning: neighbor_db_path not found: {neighbor_db_path}")
-            print(f"Will use CSV instead: {neighbor_pairs_csv}")
+            print(f"Use CSV instead: {neighbor_pairs_csv}")
         else:
             raise FileNotFoundError(f"neighbor_db_path not found: {neighbor_db_path}")
     
@@ -503,6 +501,13 @@ def compute_interscellar_volumes_3d(
         print(f"AnnData output: {output_anndata}")
     print(f"Interscellar volumes zarr: {output_mesh_zarr}")
     print(f"Cell-only volumes zarr: {output_cell_only_zarr}")
+    
+    try:
+        from ..core.compute_interscellar_volumes_3d import _cleanup_intermediate_results
+        _cleanup_intermediate_results(intermediate_results_dir)
+    except Exception as e:
+        print(f"Warning: Could not clean up intermediate results: {e}")
+        print(f"Intermediate results directory: {intermediate_results_dir}")
     
     print("=" * 60)
     
