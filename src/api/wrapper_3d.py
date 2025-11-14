@@ -74,7 +74,6 @@ def find_cell_neighbors_3d(
     step1_time = time.time() - step1_start
     print(f"Step 1 completed in {step1_time:.2f} seconds")
     
-    # Auto-generate output paths based on input file names
     metadata_dir = os.path.dirname(metadata_csv_path) if os.path.dirname(metadata_csv_path) else "."
     base_name = os.path.splitext(os.path.basename(metadata_csv_path))[0]
     
@@ -292,11 +291,15 @@ def compute_interscellar_volumes_3d(
     
     if output_mesh_zarr is None:
         base_name = os.path.splitext(db_path)[0]
+        if base_name.endswith('_interscellar_volumes'):
+            base_name = base_name[:-len('_interscellar_volumes')]
         output_mesh_zarr = f"{base_name}_interscellar_volumes.zarr"
         print(f"output_mesh_zarr: {output_mesh_zarr}")
     
     if output_cell_only_zarr is None:
         base_name = os.path.splitext(db_path)[0]
+        if base_name.endswith('_interscellar_volumes'):
+            base_name = base_name[:-len('_interscellar_volumes')]
         output_cell_only_zarr = f"{base_name}_cell_only_volumes.zarr"
         print(f"output_cell_only_zarr: {output_cell_only_zarr}")
     
@@ -537,12 +540,13 @@ def compute_cell_only_volumes_3d(
         interscellar_basename = os.path.basename(interscellar_volumes_zarr)
         base_name = os.path.splitext(interscellar_basename)[0]
         
-        if base_name.endswith('_interscellar_volumes'):
-            output_basename = base_name.replace('_interscellar_volumes', '_cell_only_volumes') + '.zarr'
-        elif base_name.endswith('_interscellar_volumes_interscellar_volumes'):
-            output_basename = base_name.replace('_interscellar_volumes_interscellar_volumes', '_cell_only_volumes') + '.zarr'
-        else:
+        while base_name.endswith('_interscellar_volumes'):
+            base_name = base_name[:-len('_interscellar_volumes')]
+        
+        if not base_name.endswith('_cell_only_volumes'):
             output_basename = base_name + '_cell_only_volumes.zarr'
+        else:
+            output_basename = base_name + '.zarr'
         
         output_zarr_path = os.path.join(interscellar_dir, output_basename)
     
