@@ -84,3 +84,9 @@ packages = ["interscellar", "interscellar.api", "interscellar.core", "interscell
 [tool.setuptools.package-data]
 "*" = ["*.py", "*.md", "LICENSE"]
 
+[dependency-groups]
+docs = [
+    "myst-parser>=3.0.1",
+    "sphinx-book-theme>=1.0.1",
+]
+
