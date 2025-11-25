@@ -907,6 +907,59 @@ def build_cell_graph_database_2d(
     
     return conn
 
+def _load_polygons_from_file(polygon_file_path: str, cell_id_key: str = 'cell_id') -> Dict[str, list]:
+    try:
+        with open(polygon_file_path, 'r') as f:
+            data = json.load(f)
+    except Exception as e:
+        raise ValueError(f"Error loading polygon file: {e}")
+    
+    polygon_mask = {}
+    
+    if isinstance(data, dict) and data.get('type') == 'FeatureCollection' and 'features' in data:
+        # GeoJSON input format
+        print("Detected GeoJSON format")
+        for feature in data['features']:
+            if feature.get('type') != 'Feature':
+                continue
+            
+            geometry = feature.get('geometry', {})
+            properties = feature.get('properties', {})
+            
+            if cell_id_key in properties:
+                cell_id = str(properties[cell_id_key])
+            elif 'id' in properties:
+                cell_id = str(properties['id'])
+            elif 'cell_id' in properties:
+                cell_id = str(properties['cell_id'])
+            else:
+                cell_id = str(len(polygon_mask))
+            
+            geom_type = geometry.get('type', '')
+            coords = geometry.get('coordinates', [])
+            
+            if geom_type == 'Polygon':
+                if len(coords) > 0 and len(coords[0]) > 0:
+                    polygon_coords = [[float(x), float(y)] for x, y in coords[0]]
+                    if len(polygon_coords) > 1 and polygon_coords[0] == polygon_coords[-1]:
+                        polygon_coords = polygon_coords[:-1]
+                    polygon_mask[cell_id] = polygon_coords
+            elif geom_type == 'MultiPolygon':
+                if len(coords) > 0:
+                    largest_poly = max(coords, key=lambda p: len(p[0]) if len(p) > 0 and len(p[0]) > 0 else 0)
+                    if len(largest_poly) > 0 and len(largest_poly[0]) > 0:
+                        polygon_coords = [[float(x), float(y)] for x, y in largest_poly[0]]
+                        if len(polygon_coords) > 1 and polygon_coords[0] == polygon_coords[-1]:
+                            polygon_coords = polygon_coords[:-1]
+                        polygon_mask[cell_id] = polygon_coords
+    else:
+        # JSON input format
+        print("Detected JSON format")
+        polygon_mask = data
+    
+    return polygon_mask
+
+
 def create_neighbor_edge_table_database_2d(
     polygon_json_path: str,
     metadata_df: pd.DataFrame,
@@ -928,10 +981,9 @@ def create_neighbor_edge_table_database_2d(
     print(f"Loading polygon mask from: {polygon_json_path}")
     
     try:
-        with open(polygon_json_path, 'r') as f:
-            polygon_mask = json.load(f)
+        polygon_mask = _load_polygons_from_file(polygon_json_path, cell_id_key=cell_id)
     except Exception as e:
-        raise ValueError(f"Error loading polygon JSON file: {e}")
+        raise ValueError(f"Error loading polygon file: {e}")
     
     print(f"Loaded {len(polygon_mask)} polygons")
     
