@@ -13,6 +13,13 @@
 pip install interscellar
 ```
 
+**Install package with SpatialData support:**
+```sh
+pip install "interscellar[spatialdata]"
+# or
+pip install interscellar spatialdata
+```
+
 ## Usage
 
 **Import:**
@@ -55,6 +62,25 @@ cellonly_3d = interscellar.compute_cell_only_volumes_3d(
 )
 ```
 
+**3D: SpatialData I/O Support**
+```python
+import spatialdata as sd
+
+# Load SpatialData object
+sdata = sd.read_zarr("data/spatialdata.zarr")
+
+# (1) Cell Neighbor Detection
+neighbors_3d, adata, conn, sdata_out = interscellar.find_cell_neighbors_3d(
+    ome_zarr_path=sdata,
+    metadata_csv_path=sdata,
+    max_distance_um=0.5,
+    voxel_size_um=(0.56, 0.28, 0.28),
+    labels_key="segmentation",
+    table_key="cell_metadata",
+    return_spatialdata=True
+)
+```
+
 ### 2D Pipeline:
 
 **(1) Cell Neighbor Detection & Graph Construction**
@@ -67,6 +93,27 @@ neighbors_2d, adata, conn = interscellar.find_cell_neighbors_2d(
     n_jobs=4
 )
 ```
+
+**2D: SpatialData I/O Support**
+```python
+import spatialdata as sd
+
+# Load SpatialData object
+sdata = sd.read_zarr("data/spatialdata.zarr")
+
+# (1) Cell Neighbor Detection
+neighbors_2d, adata, conn, sdata_out = interscellar.find_cell_neighbors_2d(
+    polygon_json_path=sdata,
+    metadata_csv_path=sdata,
+    max_distance_um=1.0,
+    pixel_size_um=0.1085,
+    shapes_key="cell_polygons",
+    table_key="cell_metadata",
+    return_spatialdata=True
+)
+```
+
+InterSCellar now supports scverse's SpatialData format! You can pass SpatialData objects directly to the functions. Results (neighbor pairs, interscellar volumes/areas) will be added as new table elements in the returned SpatialData object.
 
 ### Utilities:
 

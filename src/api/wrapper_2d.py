@@ -2,7 +2,7 @@
 
 import pandas as pd
 import numpy as np
-from typing import Optional, Tuple
+from typing import Optional, Tuple, TYPE_CHECKING, Any
 from tqdm import tqdm
 import time
 import os
@@ -19,11 +19,28 @@ from ..core.find_cell_neighbors_2d import (
     build_global_mask_2d_with_mapping
 )
 
+from ..core.spatialdata_utils import (
+    is_spatialdata,
+    extract_polygons_from_spatialdata,
+    extract_table_from_spatialdata,
+    convert_polygons_to_temp_json,
+    add_neighbors_to_spatialdata,
+    create_spatialdata_with_table,
+    get_pixel_size_from_spatialdata,
+    SPATIALDATA_AVAILABLE,
+)
+
 try:
     import anndata as ad
     ANNDATA_AVAILABLE = True
 except ImportError:
     ANNDATA_AVAILABLE = False
+
+if TYPE_CHECKING:
+    try:
+        from spatialdata import SpatialData
+    except ImportError:
+        SpatialData = Any
 
 # API: Wrapper functions
 
@@ -44,8 +61,9 @@ def find_cell_neighbors_2d(
     return_connection: bool = False,
     save_surfaces_pickle: Optional[str] = None,
     load_surfaces_pickle: Optional[str] = None,
-    save_graph_state_pickle: Optional[str] = None
-) -> Tuple[Optional[pd.DataFrame], Optional[object], Optional[object]]:
+    save_graph_state_pickle: Optional[str] = None,
+    return_spatialdata: bool = False
+) -> Tuple[Optional[pd.DataFrame], Optional[object], Optional[object], Optional['SpatialData']]:
     
     print("=" * 60)
     print("InterSCellar: Surface-based Cell Neighbor Detection - 2D")
@@ -53,13 +71,37 @@ def find_cell_neighbors_2d(
     
     overall_start_time = time.time()
     
-    print(f"\n1. Loading metadata from: {metadata_csv_path}...")
+    polygon_input_is_spatialdata = is_spatialdata(polygon_json_path)
+    metadata_input_is_spatialdata = is_spatialdata(metadata_csv_path)
+    input_sdata = polygon_json_path if polygon_input_is_spatialdata else None
+    temp_polygon_file = None
+    output_sdata = None
+    
+    if metadata_input_is_spatialdata or (metadata_csv_path is None and polygon_input_is_spatialdata):
+        print("\n1. Loading metadata from SpatialData object...")
+    else:
+        print(f"\n1. Loading metadata from: {metadata_csv_path}...")
+    
     step1_start = time.time()
-    try:
-        metadata_df = pd.read_csv(metadata_csv_path)
-        print(f"Loaded {len(metadata_df)} cells")
-    except Exception as e:
-        raise ValueError(f"Error loading metadata CSV: {e}")
+    
+    if metadata_input_is_spatialdata:
+        try:
+            metadata_df = extract_table_from_spatialdata(metadata_csv_path)
+            print(f"Loaded {len(metadata_df)} cells from SpatialData table")
+        except Exception as e:
+            raise ValueError(f"Error extracting metadata from SpatialData: {e}")
+    elif metadata_csv_path is None and polygon_input_is_spatialdata:
+        try:
+            metadata_df = extract_table_from_spatialdata(polygon_json_path)
+            print(f"Loaded {len(metadata_df)} cells from SpatialData object")
+        except Exception as e:
+            raise ValueError(f"Error extracting metadata from SpatialData: {e}")
+    else:
+        try:
+            metadata_df = pd.read_csv(metadata_csv_path)
+            print(f"Loaded {len(metadata_df)} cells")
+        except Exception as e:
+            raise ValueError(f"Error loading metadata CSV: {e}")
     
     required_cols = [cell_id, cell_type, centroid_x, centroid_y]
     missing_cols = [col for col in required_cols if col not in metadata_df.columns]
@@ -69,8 +111,13 @@ def find_cell_neighbors_2d(
     step1_time = time.time() - step1_start
     print(f"Step 1 completed in {step1_time:.2f} seconds")
     
-    metadata_dir = os.path.dirname(metadata_csv_path) if os.path.dirname(metadata_csv_path) else "."
-    base_name = os.path.splitext(os.path.basename(metadata_csv_path))[0]
+    metadata_dir = "."
+    base_name = "cell_metadata"
+    if isinstance(metadata_csv_path, str) and metadata_csv_path:
+        metadata_dir = os.path.dirname(metadata_csv_path) if os.path.dirname(metadata_csv_path) else "."
+        base_name = os.path.splitext(os.path.basename(metadata_csv_path))[0]
+    elif polygon_input_is_spatialdata:
+        base_name = "spatialdata"
     
     if db_path is None:
         db_path = os.path.join(metadata_dir, f"{base_name}_neighbor_graph_2d.db")
@@ -84,13 +131,47 @@ def find_cell_neighbors_2d(
         output_anndata = os.path.join(metadata_dir, f"{base_name}_neighbors_2d.h5ad")
         print(f"output_anndata: {output_anndata}")
     
-    print(f"\n2. Validating input file: {polygon_json_path}...")
-    step2_start = time.time()
-    if not os.path.exists(polygon_json_path):
-        raise FileNotFoundError(f"JSON file not found: {polygon_json_path}")
-    print(f"JSON file found")
-    step2_time = time.time() - step2_start
-    print(f"Step 2 completed in {step2_time:.2f} seconds")
+    polygon_file_for_processing = polygon_json_path
+    if polygon_input_is_spatialdata:
+        if not SPATIALDATA_AVAILABLE:
+            raise ImportError(
+                "SpatialData support requires the 'spatialdata' package. "
+                "Install it with: pip install spatialdata"
+            )
+        
+        print("\n2. Detected SpatialData input. Converting shapes to temporary JSON...")
+        step2_start = time.time()
+        try:
+            polygon_mask = extract_polygons_from_spatialdata(polygon_json_path)
+        except Exception as e:
+            raise ValueError(f"Error extracting polygons from SpatialData: {e}")
+        
+        temp_polygon_file = convert_polygons_to_temp_json(polygon_mask)
+        polygon_file_for_processing = temp_polygon_file
+        step2_time = time.time() - step2_start
+        print(f"Temporary polygon JSON created at: {polygon_file_for_processing}")
+        print(f"Step 2 completed in {step2_time:.2f} seconds")
+        
+        if pixel_size_um is None or pixel_size_um == 0.0:
+            extracted_pixel = get_pixel_size_from_spatialdata(polygon_json_path)
+            if extracted_pixel is None:
+                raise ValueError(
+                    "pixel_size_um must be provided when SpatialData transformations "
+                )
+            pixel_size_um = extracted_pixel
+    else:
+        print(f"\n2. Validating input file: {polygon_json_path}...")
+        step2_start = time.time()
+        if not os.path.exists(polygon_json_path):
+            raise FileNotFoundError(f"JSON file not found: {polygon_json_path}")
+        print(f"JSON file found")
+        step2_time = time.time() - step2_start
+        print(f"Step 2 completed in {step2_time:.2f} seconds")
+    
+    if pixel_size_um is None or pixel_size_um == 0.0:
+        raise ValueError(
+            "pixel_size_um must be provided when using polygon JSON input."
+        )
     
     print(f"\n3. Building neighbor graph...")
     print(f"Parameters: max_distance={max_distance_um}μm, n_jobs={n_jobs}")
@@ -103,7 +184,7 @@ def find_cell_neighbors_2d(
     
     try:
         conn = create_neighbor_edge_table_database_2d(
-            polygon_json_path=polygon_json_path,
+            polygon_json_path=polygon_file_for_processing,
             metadata_df=metadata_df,
             max_distance_um=max_distance_um,
             pixel_size_um=pixel_size_um,
@@ -158,6 +239,19 @@ def find_cell_neighbors_2d(
     step4_time = time.time() - step4_start
     print(f"Step 4 completed in {step4_time:.2f} seconds")
     
+    if input_sdata is not None and neighbor_table_df is not None:
+        try:
+            add_neighbors_to_spatialdata(input_sdata, neighbor_table_df)
+            output_sdata = input_sdata
+            print("Neighbor results added to SpatialData object")
+        except Exception as e:
+            print(f"Warning: Could not add results to SpatialData: {e}")
+    
+    if output_sdata is None and return_spatialdata and neighbor_table_df is not None:
+        output_sdata = create_spatialdata_with_table(neighbor_table_df, "neighbors")
+        if output_sdata is None:
+            print("Warning: SpatialData dependencies missing; cannot create SpatialData output.")
+    
     overall_time = time.time() - overall_start_time
     print(f"\n5. Pipeline completed successfully!")
     print(f"Total execution time: {overall_time:.2f} seconds")
@@ -167,10 +261,20 @@ def find_cell_neighbors_2d(
     if output_anndata:
         print(f"AnnData output: {output_anndata}")
     
+    if temp_polygon_file and os.path.exists(temp_polygon_file):
+        try:
+            os.unlink(temp_polygon_file)
+        except OSError:
+            pass
+    
     print("=" * 60)
     
     if return_connection:
-        return neighbor_table_df, adata, conn
+        base_result = (neighbor_table_df, adata, conn)
     else:
         conn.close()
-        return neighbor_table_df, adata, None
+        base_result = (neighbor_table_df, adata, None)
+    
+    if return_spatialdata:
+        return base_result + (output_sdata,)
+    return base_result

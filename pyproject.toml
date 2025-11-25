@@ -63,9 +63,13 @@ anndata = [
 duckdb = [
     "duckdb>=0.6.0",
 ]
+spatialdata = [
+    "spatialdata>=0.1.0",
+]
 all = [
     "anndata>=0.8.0",
     "duckdb>=0.6.0",
+    "spatialdata>=0.1.0",
 ]
 
 [project.scripts]

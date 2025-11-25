@@ -41,6 +41,25 @@ from .compute_interscellar_volumes_3d import (
     ANNDATA_AVAILABLE,
 )
 
+# SpatialData I/O functions
+from .spatialdata_utils import (
+    is_spatialdata,
+    # 2D utilities
+    extract_polygons_from_spatialdata,
+    convert_polygons_to_temp_json,
+    get_pixel_size_from_spatialdata,
+    # 3D utilities
+    extract_labels_from_spatialdata,
+    convert_mask_to_temp_zarr,
+    get_voxel_size_from_spatialdata,
+    # Metadata utilities
+    extract_table_from_spatialdata,
+    add_neighbors_to_spatialdata,
+    add_volumes_to_spatialdata,
+    create_spatialdata_with_table,
+    SPATIALDATA_AVAILABLE,
+)
+
 __all__ = [
     # 2D neighbor detection
     "build_global_mask_2d",
@@ -76,5 +95,18 @@ __all__ = [
     "get_anndata_from_interscellar_database",
     "export_interscellar_volumes_to_anndata",
     "ANNDATA_AVAILABLE",
+    # SpatialData I/O
+    "is_spatialdata",
+    "extract_polygons_from_spatialdata",
+    "convert_polygons_to_temp_json",
+    "get_pixel_size_from_spatialdata",
+    "extract_labels_from_spatialdata",
+    "convert_mask_to_temp_zarr",
+    "get_voxel_size_from_spatialdata",
+    "extract_table_from_spatialdata",
+    "add_neighbors_to_spatialdata",
+    "add_volumes_to_spatialdata",
+    "create_spatialdata_with_table",
+    "SPATIALDATA_AVAILABLE",
 ]
 

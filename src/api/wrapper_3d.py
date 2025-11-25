@@ -7,6 +7,7 @@ from tqdm import tqdm
 import time
 import sqlite3
 import os
+import shutil
 
 from ..core.find_cell_neighbors_3d import(
     create_neighbor_edge_table_database_3d,
@@ -27,6 +28,16 @@ from ..core.compute_interscellar_volumes_3d import(
     get_anndata_from_interscellar_database,
     export_interscellar_volumes_to_anndata,
     ANNDATA_AVAILABLE
+)
+
+from ..core.spatialdata_utils import (
+    is_spatialdata,
+    extract_labels_from_spatialdata,
+    extract_table_from_spatialdata,
+    convert_mask_to_temp_zarr,
+    add_neighbors_to_spatialdata,
+    get_voxel_size_from_spatialdata,
+    SPATIALDATA_AVAILABLE,
 )
 
 # API: Wrapper functions
@@ -58,13 +69,36 @@ def find_cell_neighbors_3d(
     
     overall_start_time = time.time()
     
-    print(f"\n1. Loading metadata from: {metadata_csv_path}...")
+    ome_input_is_spatialdata = is_spatialdata(ome_zarr_path)
+    metadata_input_is_spatialdata = is_spatialdata(metadata_csv_path)
+    input_sdata = ome_zarr_path if ome_input_is_spatialdata else None
+    temp_zarr_path = None
+    
+    if metadata_input_is_spatialdata or (metadata_csv_path is None and ome_input_is_spatialdata):
+        print("\n1. Loading metadata from SpatialData object...")
+    else:
+        print(f"\n1. Loading metadata from: {metadata_csv_path}...")
+    
     step1_start = time.time()
-    try:
-        metadata_df = pd.read_csv(metadata_csv_path)
-        print(f"Loaded {len(metadata_df)} cells")
-    except Exception as e:
-        raise ValueError(f"Error loading metadata CSV: {e}")
+    
+    if metadata_input_is_spatialdata:
+        try:
+            metadata_df = extract_table_from_spatialdata(metadata_csv_path)
+            print(f"Loaded {len(metadata_df)} cells from SpatialData table")
+        except Exception as e:
+            raise ValueError(f"Error extracting metadata from SpatialData: {e}")
+    elif metadata_csv_path is None and ome_input_is_spatialdata:
+        try:
+            metadata_df = extract_table_from_spatialdata(ome_zarr_path)
+            print(f"Loaded {len(metadata_df)} cells from SpatialData object")
+        except Exception as e:
+            raise ValueError(f"Error extracting metadata from SpatialData: {e}")
+    else:
+        try:
+            metadata_df = pd.read_csv(metadata_csv_path)
+            print(f"Loaded {len(metadata_df)} cells")
+        except Exception as e:
+            raise ValueError(f"Error loading metadata CSV: {e}")
     
     required_cols = [cell_id, cell_type, centroid_x, centroid_y, centroid_z]
     missing_cols = [col for col in required_cols if col not in metadata_df.columns]
@@ -74,8 +108,13 @@ def find_cell_neighbors_3d(
     step1_time = time.time() - step1_start
     print(f"Step 1 completed in {step1_time:.2f} seconds")
     
-    metadata_dir = os.path.dirname(metadata_csv_path) if os.path.dirname(metadata_csv_path) else "."
-    base_name = os.path.splitext(os.path.basename(metadata_csv_path))[0]
+    metadata_dir = "."
+    base_name = "cell_metadata"
+    if isinstance(metadata_csv_path, str) and metadata_csv_path:
+        metadata_dir = os.path.dirname(metadata_csv_path) if os.path.dirname(metadata_csv_path) else "."
+        base_name = os.path.splitext(os.path.basename(metadata_csv_path))[0]
+    elif ome_input_is_spatialdata:
+        base_name = "spatialdata"
     
     if db_path is None:
         db_path = os.path.join(metadata_dir, f"{base_name}_neighbor_graph.db")
@@ -90,14 +129,48 @@ def find_cell_neighbors_3d(
         print(f"output_anndata: {output_anndata}")
     
     if save_surfaces_pickle is None:
-        base_name = os.path.splitext(db_path)[0]
-        save_surfaces_pickle = f"{base_name}_surfaces.pkl"
+        base_for_pickle = os.path.splitext(db_path)[0]
+        save_surfaces_pickle = f"{base_for_pickle}_surfaces.pkl"
         print(f"Surfaces pickle path: {save_surfaces_pickle}")
     
     if save_graph_state_pickle is None:
-        base_name = os.path.splitext(db_path)[0]
-        save_graph_state_pickle = f"{base_name}_graph_state.pkl"
+        base_for_pickle = os.path.splitext(db_path)[0]
+        save_graph_state_pickle = f"{base_for_pickle}_graph_state.pkl"
         print(f"Graph state pickle path: {save_graph_state_pickle}")
+    
+    ome_file_for_processing = ome_zarr_path
+    if ome_input_is_spatialdata:
+        if not SPATIALDATA_AVAILABLE:
+            raise ImportError(
+                "SpatialData support requires the 'spatialdata' package. "
+                "Install it with: pip install spatialdata"
+            )
+        
+        print("\n2. Detected SpatialData input. Converting labels to temporary zarr...")
+        conversion_start = time.time()
+        try:
+            mask_3d = extract_labels_from_spatialdata(ome_zarr_path)
+        except Exception as e:
+            raise ValueError(f"Error extracting labels from SpatialData: {e}")
+        
+        temp_zarr_path = convert_mask_to_temp_zarr(mask_3d)
+        ome_file_for_processing = temp_zarr_path
+        conversion_time = time.time() - conversion_start
+        print(f"Temporary zarr created at: {ome_file_for_processing}")
+        print(f"Conversion completed in {conversion_time:.2f} seconds")
+        
+        if voxel_size_um is None:
+            extracted_voxel = get_voxel_size_from_spatialdata(ome_zarr_path)
+            if extracted_voxel is None:
+                raise ValueError(
+                    "voxel_size_um must be provided when SpatialData transformations "
+                    "do not specify voxel size."
+                )
+            voxel_size_um = extracted_voxel
+    if voxel_size_um is None:
+        raise ValueError(
+            "voxel_size_um must be provided when using OME-Zarr inputs."
+        )
     
     print(f"\n2. Building neighbor graph...")
     print(f"Parameters: max_distance={max_distance_um}μm, n_jobs={n_jobs}")
@@ -105,12 +178,11 @@ def find_cell_neighbors_3d(
         print(f"Mode: Touching cells only")
     else:
         print(f"Mode: Touching cells + near-neighbors")
-    
     step2_start = time.time()
     
     try:
         conn = create_neighbor_edge_table_database_3d(
-            ome_zarr_path=ome_zarr_path,
+            ome_zarr_path=ome_file_for_processing,
             metadata_df=metadata_df,
             max_distance_um=max_distance_um,
             voxel_size_um=voxel_size_um,
@@ -168,6 +240,13 @@ def find_cell_neighbors_3d(
     step3_time = time.time() - step3_start
     print(f"Step 3 completed in {step3_time:.2f} seconds")
     
+    if input_sdata is not None and neighbor_table_df is not None:
+        try:
+            add_neighbors_to_spatialdata(input_sdata, neighbor_table_df)
+            print("Neighbor results added to SpatialData object")
+        except Exception as e:
+            print(f"Warning: Could not add results to SpatialData: {e}")
+    
     overall_time = time.time() - overall_start_time
     print(f"\n4. Pipeline completed successfully!")
     print(f"Total execution time: {overall_time:.2f} seconds")
@@ -176,6 +255,12 @@ def find_cell_neighbors_3d(
         print(f"CSV output: {output_csv}")
     if output_anndata:
         print(f"AnnData output: {output_anndata}")
+    
+    if temp_zarr_path and os.path.exists(temp_zarr_path):
+        try:
+            shutil.rmtree(os.path.dirname(temp_zarr_path))
+        except OSError:
+            pass
     
     print("=" * 60)
     
