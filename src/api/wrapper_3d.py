@@ -2,7 +2,7 @@
 
 import pandas as pd
 import numpy as np
-from typing import Optional, Tuple, List, Dict, Any
+from typing import Optional, Tuple, List, Dict, Any, TYPE_CHECKING
 from tqdm import tqdm
 import time
 import sqlite3
@@ -36,9 +36,16 @@ from ..core.spatialdata_utils import (
     extract_table_from_spatialdata,
     convert_mask_to_temp_zarr,
     add_neighbors_to_spatialdata,
+    create_spatialdata_with_table,
     get_voxel_size_from_spatialdata,
     SPATIALDATA_AVAILABLE,
 )
+
+if TYPE_CHECKING:
+    try:
+        from spatialdata import SpatialData
+    except ImportError:
+        SpatialData = Any
 
 # API: Wrapper functions
 
@@ -60,8 +67,9 @@ def find_cell_neighbors_3d(
     return_connection: bool = False,
     save_surfaces_pickle: Optional[str] = None,
     load_surfaces_pickle: Optional[str] = None,
-    save_graph_state_pickle: Optional[str] = None
-) -> Tuple[Optional[pd.DataFrame], Optional[object], Optional[object]]:
+    save_graph_state_pickle: Optional[str] = None,
+    return_spatialdata: bool = False
+) -> Tuple[Optional[pd.DataFrame], Optional[object], Optional[object], Optional['SpatialData']]:
     
     print("=" * 60)
     print("InterSCellar: Surface-based Cell Neighbor Detection - 3D")
@@ -73,6 +81,7 @@ def find_cell_neighbors_3d(
     metadata_input_is_spatialdata = is_spatialdata(metadata_csv_path)
     input_sdata = ome_zarr_path if ome_input_is_spatialdata else None
     temp_zarr_path = None
+    output_sdata = None
     
     if metadata_input_is_spatialdata or (metadata_csv_path is None and ome_input_is_spatialdata):
         print("\n1. Loading metadata from SpatialData object...")
@@ -159,15 +168,14 @@ def find_cell_neighbors_3d(
         print(f"Temporary zarr created at: {ome_file_for_processing}")
         print(f"Conversion completed in {conversion_time:.2f} seconds")
         
-        if voxel_size_um is None:
+        if voxel_size_um is None or voxel_size_um == (0.0, 0.0, 0.0):
             extracted_voxel = get_voxel_size_from_spatialdata(ome_zarr_path)
             if extracted_voxel is None:
                 raise ValueError(
-                    "voxel_size_um must be provided when SpatialData transformations "
-                    "do not specify voxel size."
+                    "voxel_size_um must be provided when SpatialData transformations."
                 )
             voxel_size_um = extracted_voxel
-    if voxel_size_um is None:
+    if voxel_size_um is None or voxel_size_um == (0.0, 0.0, 0.0):
         raise ValueError(
             "voxel_size_um must be provided when using OME-Zarr inputs."
         )
@@ -243,9 +251,15 @@ def find_cell_neighbors_3d(
     if input_sdata is not None and neighbor_table_df is not None:
         try:
             add_neighbors_to_spatialdata(input_sdata, neighbor_table_df)
+            output_sdata = input_sdata
             print("Neighbor results added to SpatialData object")
         except Exception as e:
             print(f"Warning: Could not add results to SpatialData: {e}")
+    
+    if output_sdata is None and return_spatialdata and neighbor_table_df is not None:
+        output_sdata = create_spatialdata_with_table(neighbor_table_df, "neighbors")
+        if output_sdata is None:
+            print("Warning: SpatialData dependencies missing; cannot create SpatialData output.")
     
     overall_time = time.time() - overall_start_time
     print(f"\n4. Pipeline completed successfully!")
@@ -265,10 +279,14 @@ def find_cell_neighbors_3d(
     print("=" * 60)
     
     if return_connection:
-        return neighbor_table_df, adata, conn
+        if return_spatialdata:
+            return neighbor_table_df, adata, conn, output_sdata
+        return neighbor_table_df, adata, conn, None
     else:
         conn.close()
-        return neighbor_table_df, adata, None
+        if return_spatialdata:
+            return neighbor_table_df, adata, None, output_sdata
+        return neighbor_table_df, adata, None, None
 
 def compute_interscellar_volumes_3d(
     ome_zarr_path: str,

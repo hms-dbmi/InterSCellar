@@ -30,23 +30,54 @@ import interscellar
 ### 3D Pipeline:
 
 **(1) Cell Neighbor Detection & Graph Construction**
-```sh
-neighbors_3d, adata, conn = interscellar.find_cell_neighbors_3d(
+
+```python
+# Using file paths
+neighbors_3d, adata, conn, _ = interscellar.find_cell_neighbors_3d(
     ome_zarr_path="data/segmentation.zarr",
     metadata_csv_path="data/cell_metadata.csv",
     max_distance_um=0.5,
     voxel_size_um=(0.56, 0.28, 0.28),
-    n_jobs=4
+    centroid_prefilter_radius_um=75.0,
+    cell_id="CellID",
+    cell_type="phenotype",
+    centroid_x="X_centroid",
+    centroid_y="Y_centroid",
+    centroid_z="Z_centroid",
+    n_jobs=4,
+    return_spatialdata=False
 )
 ```
 
+```python
+# Using SpatialData objects
+import spatialdata as sd
+
+sdata = sd.read_zarr("data/spatialdata.zarr")
+
+neighbors_3d, adata, conn, sdata_out = interscellar.find_cell_neighbors_3d(
+    ome_zarr_path=sdata,
+    metadata_csv_path=sdata,
+    max_distance_um=0.5,
+    voxel_size_um=(0.56, 0.28, 0.28),
+    return_spatialdata=True
+)
+```
+
+**Output:**
+- `neighbors_3d`: pandas DataFrame with neighbor pairs
+- `adata`: AnnData object with neighbor graph (if `output_anndata` specified)
+- `conn`: SQLite connection to neighbor database (if `return_connection=True`)
+- `sdata_out`: SpatialData object with neighbor table added (if `return_spatialdata=True`)
+- Files: CSV, AnnData (.h5ad), SQLite database (.db), pickle files for surfaces/graph state
+
 **(2) Interscellar Volume Computation**
-```sh
+```python
 # Interscellar volumes
 volumes_3d, adata, conn = interscellar.compute_interscellar_volumes_3d(
     ome_zarr_path="data/segmentation.zarr",
     neighbor_pairs_csv="results/neighbors_3d.csv",
-    neighbor_db_path="/results/neighbor_graph.db",
+    neighbor_db_path="results/neighbor_graph.db",
     voxel_size_um=(0.56, 0.28, 0.28),
     max_distance_um=3.0,
     intracellular_threshold_um=1.0,
@@ -54,7 +85,7 @@ volumes_3d, adata, conn = interscellar.compute_interscellar_volumes_3d(
 )
 ```
 
-```sh
+```python
 # Cell-only volumes
 cellonly_3d = interscellar.compute_cell_only_volumes_3d(
     ome_zarr_path="data/segmentation.zarr",
@@ -62,58 +93,40 @@ cellonly_3d = interscellar.compute_cell_only_volumes_3d(
 )
 ```
 
-**3D: SpatialData I/O Support**
-```python
-import spatialdata as sd
-
-# Load SpatialData object
-sdata = sd.read_zarr("data/spatialdata.zarr")
-
-# (1) Cell Neighbor Detection
-neighbors_3d, adata, conn, sdata_out = interscellar.find_cell_neighbors_3d(
-    ome_zarr_path=sdata,
-    metadata_csv_path=sdata,
-    max_distance_um=0.5,
-    voxel_size_um=(0.56, 0.28, 0.28),
-    labels_key="segmentation",
-    table_key="cell_metadata",
-    return_spatialdata=True
-)
-```
-
 ### 2D Pipeline:
 
 **(1) Cell Neighbor Detection & Graph Construction**
-```sh
-neighbors_2d, adata, conn = interscellar.find_cell_neighbors_2d(
+
+```python
+# Using file paths
+neighbors_2d, adata, conn, _ = interscellar.find_cell_neighbors_2d(
     polygon_json_path="data/cell_polygons.json",
     metadata_csv_path="data/cell_metadata.csv",
     max_distance_um=1.0,
     pixel_size_um=0.1085,
-    n_jobs=4
+    centroid_prefilter_radius_um=75.0,
+    cell_id="cell_id",
+    cell_type="subclass",
+    centroid_x="X",
+    centroid_y="Y",
+    n_jobs=4,
+    return_spatialdata=False
 )
 ```
 
-**2D: SpatialData I/O Support**
 ```python
+# Using SpatialData objects
 import spatialdata as sd
 
-# Load SpatialData object
 sdata = sd.read_zarr("data/spatialdata.zarr")
 
-# (1) Cell Neighbor Detection
 neighbors_2d, adata, conn, sdata_out = interscellar.find_cell_neighbors_2d(
-    polygon_json_path=sdata,
+    polygon_json_path=sdata, 
     metadata_csv_path=sdata,
     max_distance_um=1.0,
     pixel_size_um=0.1085,
-    shapes_key="cell_polygons",
-    table_key="cell_metadata",
     return_spatialdata=True
 )
-```
-
-InterSCellar now supports scverse's SpatialData format! You can pass SpatialData objects directly to the functions. Results (neighbor pairs, interscellar volumes/areas) will be added as new table elements in the returned SpatialData object.
 
 ### Utilities:
 

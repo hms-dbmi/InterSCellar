@@ -270,11 +270,11 @@ def find_cell_neighbors_2d(
     print("=" * 60)
     
     if return_connection:
-        base_result = (neighbor_table_df, adata, conn)
+        if return_spatialdata:
+            return neighbor_table_df, adata, conn, output_sdata
+        return neighbor_table_df, adata, conn, None
     else:
         conn.close()
-        base_result = (neighbor_table_df, adata, None)
-    
-    if return_spatialdata:
-        return base_result + (output_sdata,)
-    return base_result
+        if return_spatialdata:
+            return neighbor_table_df, adata, None, output_sdata
+        return neighbor_table_df, adata, None, None

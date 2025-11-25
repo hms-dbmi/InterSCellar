@@ -157,16 +157,10 @@ def main():
     
     print(f"Interscellar volumes shape: {interscellar_mesh.shape}")
     
-    if interscellar_mesh.ndim == 5:
-        print("Interscellar zarr is 5D, using [0, 0, ...] slice for visualization")
-        interscellar_mesh_3d = interscellar_mesh[0, 0]
-    else:
-        interscellar_mesh_3d = interscellar_mesh
-    
-    if cell_only_3d.shape != interscellar_mesh_3d.shape:
+    if cell_only_3d.shape != interscellar_mesh.shape:
         print("Error: cell-only and interscellar volumes have different shapes.")
         print(f"  cell-only shape:  {cell_only_3d.shape}")
-        print(f"  interscellar shape: {interscellar_mesh_3d.shape}")
+        print(f"  interscellar shape: {interscellar_mesh.shape}")
         sys.exit(1)
 
     print(f"Loading cell IDs for pair {args.pair_id}...")
@@ -229,7 +223,7 @@ def main():
     print("Finding bounding box for pair region...")
     
     cell_only_array = np.asarray(cell_only_3d)
-    interscellar_array = np.asarray(interscellar_mesh_3d)
+    interscellar_array = np.asarray(interscellar_mesh)
     
     print(f"Searching for pair_id {args.pair_id} in interscellar volumes...")
     pair_coords = np.argwhere(interscellar_array == args.pair_id)

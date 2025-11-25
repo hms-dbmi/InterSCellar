@@ -123,17 +123,10 @@ def main():
     
     print(f"  Interscellar volumes shape: {interscellar_labels.shape}")
     
-    if interscellar_labels.ndim == 5:
-        print(f"Interscellar zarr shape (5D): {interscellar_labels.shape}")
-        print(f"Using [0, 0, ...] for visualization")
-        interscellar_3d = interscellar_labels[0, 0]
-    else:
-        interscellar_3d = interscellar_labels
-    
-    if cell_only_3d.shape != interscellar_3d.shape:
+    if cell_only_3d.shape != interscellar_labels.shape:
         print(f"Warning: Shape mismatch!")
         print(f"Cell-only: {cell_only_3d.shape}")
-        print(f"Interscellar: {interscellar_3d.shape}")
+        print(f"Interscellar: {interscellar_labels.shape}")
         print(f"This may cause alignment issues")
     else:
         print(f"Shapes match: {cell_only_3d.shape}")
@@ -162,7 +155,7 @@ def main():
     
     print(f"  Adding interscellar volumes layer...")
     viewer.add_labels(
-        interscellar_3d,
+        interscellar_labels,
         name="interscellar_volumes",
         opacity=args.interscellar_opacity
     )
