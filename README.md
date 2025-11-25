@@ -64,13 +64,6 @@ neighbors_3d, adata, conn, sdata_out = interscellar.find_cell_neighbors_3d(
 )
 ```
 
-**Output:**
-- `neighbors_3d`: pandas DataFrame with neighbor pairs
-- `adata`: AnnData object with neighbor graph (if `output_anndata` specified)
-- `conn`: SQLite connection to neighbor database (if `return_connection=True`)
-- `sdata_out`: SpatialData object with neighbor table added (if `return_spatialdata=True`)
-- Files: CSV, AnnData (.h5ad), SQLite database (.db), pickle files for surfaces/graph state
-
 **(2) Interscellar Volume Computation**
 ```python
 # Interscellar volumes
@@ -127,6 +120,7 @@ neighbors_2d, adata, conn, sdata_out = interscellar.find_cell_neighbors_2d(
     pixel_size_um=0.1085,
     return_spatialdata=True
 )
+```
 
 ### Utilities:
 
