@@ -118,21 +118,6 @@ def create_spatialdata_with_table(
     table_df: pd.DataFrame,
     table_name: str
 ) -> Optional['SpatialData']:
-    """
-    Build a new SpatialData object that contains a single table.
-
-    Parameters
-    ----------
-    table_df : pd.DataFrame
-        Table data to embed (neighbors, volumes, etc.)
-    table_name : str
-        Name of the table entry inside SpatialData
-
-    Returns
-    -------
-    SpatialData or None
-        SpatialData instance if dependencies are available, otherwise None.
-    """
     if not SPATIALDATA_AVAILABLE or not ANNDATA_AVAILABLE:
         return None
     
