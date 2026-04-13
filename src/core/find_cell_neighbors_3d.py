@@ -17,6 +17,7 @@ import csv
 import sqlite3
 import os
 import pickle
+import traceback
 import math
 import zarr
 
@@ -506,7 +507,7 @@ def create_graph_database(db_path: str = 'cell_neighbor_pair_graph.db') -> sqlit
     # Neighbor (Edge) table
     cursor.execute("""
     CREATE TABLE neighbors (
-        pair_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        pair_id INTEGER PRIMARY KEY,
         cell_id_a INTEGER,
         cell_id_b INTEGER,
         cell_type_a TEXT,
@@ -527,6 +528,32 @@ def create_graph_database(db_path: str = 'cell_neighbor_pair_graph.db') -> sqlit
     
     conn.commit()
     return conn
+
+
+def renumber_neighbors_pair_ids_sequential(conn: sqlite3.Connection) -> None:
+    df = pd.read_sql_query(
+        "SELECT cell_id_a, cell_id_b, cell_type_a, cell_type_b FROM neighbors ORDER BY pair_id",
+        conn,
+    )
+    if len(df) == 0:
+        return
+    rows = list(
+        zip(
+            range(1, len(df) + 1),
+            df["cell_id_a"].astype(int),
+            df["cell_id_b"].astype(int),
+            df["cell_type_a"],
+            df["cell_type_b"],
+        )
+    )
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM neighbors")
+    cursor.executemany(
+        "INSERT INTO neighbors (pair_id, cell_id_a, cell_id_b, cell_type_a, cell_type_b) VALUES (?,?,?,?,?)",
+        rows,
+    )
+    conn.commit()
+    print(f"Renumbered neighbors.pair_id to contiguous 1..{len(df)}")
 
 def populate_cells_table(conn: sqlite3.Connection, metadata_df: pd.DataFrame, 
                         cell_id: str = 'CellID', 
@@ -565,7 +592,7 @@ def export_graph_tables(conn: sqlite3.Connection, cells_file: str = 'cells_node_
     df_cells.to_csv(cells_file, index=False)
     print(f"Cells table saved as '{cells_file}'")
 
-    df_neighbors = pd.read_sql_query("SELECT * FROM neighbors", conn)
+    df_neighbors = pd.read_sql_query("SELECT * FROM neighbors ORDER BY pair_id", conn)
     df_neighbors.to_csv(neighbors_file, index=False)
     print(f"Neighbors table saved as '{neighbors_file}'")
 
@@ -573,45 +600,45 @@ def export_to_anndata(conn: sqlite3.Connection, output_file: str = 'cell_neighbo
     if not ANNDATA_AVAILABLE:
         print("Error: AnnData not available. Install with: pip install anndata")
         return None
-    
-    df_cells = pd.read_sql_query("SELECT * FROM cells", conn)
-    df_cells.set_index('cell_id', inplace=True)
-    
-    df_neighbors = pd.read_sql_query("SELECT * FROM neighbors", conn)
-    
-    n_cells = len(df_cells)
-    adjacency_matrix = np.zeros((n_cells, n_cells), dtype=int)
-    
-    cell_id_to_idx = {cell_id: idx for idx, cell_id in enumerate(df_cells.index)}
-    
-    for _, row in df_neighbors.iterrows():
-        idx_a = cell_id_to_idx.get(row['cell_id_a'])
-        idx_b = cell_id_to_idx.get(row['cell_id_b'])
-        if idx_a is not None and idx_b is not None:
-            adjacency_matrix[idx_a, idx_b] = 1
-            adjacency_matrix[idx_b, idx_a] = 1  # Undirected graph
-    
-    from scipy.sparse import csr_matrix
-    sparse_adjacency = csr_matrix(adjacency_matrix)
-    
-    adata = ad.AnnData(
-        X=sparse_adjacency,  # Adjacency matrix
-        obs=df_cells,  # Cell metadata
-        var=df_cells.copy(),  # Same metadata for variables
-        obsp={'spatial_connectivities': sparse_adjacency}  # Store in obsp
-    )
-    
-    adata.uns['neighbor_graph_info'] = {
-        'total_cells': n_cells,
-        'total_neighbor_pairs': len(df_neighbors),
-        'graph_type': 'undirected',
-        'distance_threshold_um': 'defined_during_construction',
-        'construction_method': 'surface_distance_based'
-    }
-    
-    adata.uns['neighbor_pairs'] = df_neighbors.to_dict('records')
-    
     try:
+        df_cells = pd.read_sql_query("SELECT * FROM cells", conn)
+        df_cells["cell_id"] = df_cells["cell_id"].astype(str)
+        df_cells.set_index("cell_id", inplace=True)
+
+        df_neighbors = pd.read_sql_query("SELECT * FROM neighbors ORDER BY pair_id", conn)
+
+        n_cells = len(df_cells)
+        adjacency_matrix = np.zeros((n_cells, n_cells), dtype=int)
+
+        cell_id_to_idx = {str(cid): idx for idx, cid in enumerate(df_cells.index)}
+
+        for _, row in df_neighbors.iterrows():
+            idx_a = cell_id_to_idx.get(str(row["cell_id_a"]))
+            idx_b = cell_id_to_idx.get(str(row["cell_id_b"]))
+            if idx_a is not None and idx_b is not None:
+                adjacency_matrix[idx_a, idx_b] = 1
+                adjacency_matrix[idx_b, idx_a] = 1  # Undirected graph
+
+        from scipy.sparse import csr_matrix
+        sparse_adjacency = csr_matrix(adjacency_matrix)
+
+        adata = ad.AnnData(
+            X=sparse_adjacency,
+            obs=df_cells,
+            var=df_cells.copy(),
+            obsp={'spatial_connectivities': sparse_adjacency}
+        )
+
+        adata.uns['neighbor_graph_info'] = {
+            'total_cells': n_cells,
+            'total_neighbor_pairs': len(df_neighbors),
+            'graph_type': 'undirected',
+            'distance_threshold_um': 'defined_during_construction',
+            'construction_method': 'surface_distance_based'
+        }
+
+        adata.uns["neighbor_pairs"] = df_neighbors.reset_index(drop=True).copy()
+
         adata.write(output_file)
         print(f"AnnData object saved to '{output_file}'")
         print(f"  - {n_cells} cells")
@@ -619,8 +646,11 @@ def export_to_anndata(conn: sqlite3.Connection, output_file: str = 'cell_neighbo
         print(f"  - Adjacency matrix shape: {adjacency_matrix.shape}")
         return adata
     except Exception as e:
-        print(f"Error saving AnnData file: {e}")
-        return adata
+        print(
+            f"Warning: AnnData export failed (non-fatal; SQLite/CSV/pickle outputs are unchanged): {e}"
+        )
+        traceback.print_exc()
+        return None
 
 def get_anndata_from_database(conn: sqlite3.Connection) -> Optional[ad.AnnData]:
     if not ANNDATA_AVAILABLE:
@@ -628,18 +658,19 @@ def get_anndata_from_database(conn: sqlite3.Connection) -> Optional[ad.AnnData]:
         return None
     
     df_cells = pd.read_sql_query("SELECT * FROM cells", conn)
-    df_cells.set_index('cell_id', inplace=True)
+    df_cells["cell_id"] = df_cells["cell_id"].astype(str)
+    df_cells.set_index("cell_id", inplace=True)
     
-    df_neighbors = pd.read_sql_query("SELECT * FROM neighbors", conn)
+    df_neighbors = pd.read_sql_query("SELECT * FROM neighbors ORDER BY pair_id", conn)
     
     n_cells = len(df_cells)
     adjacency_matrix = np.zeros((n_cells, n_cells), dtype=int)
     
-    cell_id_to_idx = {cell_id: idx for idx, cell_id in enumerate(df_cells.index)}
-    
+    cell_id_to_idx = {str(cid): idx for idx, cid in enumerate(df_cells.index)}
+
     for _, row in df_neighbors.iterrows():
-        idx_a = cell_id_to_idx.get(row['cell_id_a'])
-        idx_b = cell_id_to_idx.get(row['cell_id_b'])
+        idx_a = cell_id_to_idx.get(str(row["cell_id_a"]))
+        idx_b = cell_id_to_idx.get(str(row["cell_id_b"]))
         if idx_a is not None and idx_b is not None:
             adjacency_matrix[idx_a, idx_b] = 1
             adjacency_matrix[idx_b, idx_a] = 1  # Undirected graph
@@ -738,126 +769,149 @@ def export_to_duckdb(conn: sqlite3.Connection, output_file: str = 'cell_neighbor
     except ImportError:
         print("Error: DuckDB not available. Install with: pip install duckdb")
         return
-    
-    print(f"Exporting cell neighbor graph to DuckDB: {output_file}")
-    
-    df_cells = pd.read_sql_query("SELECT * FROM cells", conn)
-    print(f"  - {len(df_cells)} cells (nodes)")
-    
-    df_neighbors = pd.read_sql_query("SELECT * FROM neighbors", conn)
-    print(f"  - {len(df_neighbors)} neighbor pairs (edges)")
-    
-    duckdb_conn = duckdb.connect(output_file)
-    duckdb_conn.execute("""
-        CREATE TABLE cells (
-            cell_id INTEGER PRIMARY KEY,
-            cell_type VARCHAR,
-            centroid_x DOUBLE,
-            centroid_y DOUBLE,
-            centroid_z DOUBLE
+
+    duckdb_conn = None
+    try:
+        print(f"Exporting cell neighbor graph to DuckDB: {output_file}")
+
+        df_cells = pd.read_sql_query("SELECT * FROM cells", conn)
+        print(f"  - {len(df_cells)} cells (nodes)")
+
+        df_neighbors = pd.read_sql_query("SELECT * FROM neighbors ORDER BY pair_id", conn)
+        print(f"  - {len(df_neighbors)} neighbor pairs (edges)")
+
+        duckdb_conn = duckdb.connect(output_file)
+        for stmt in (
+            "DROP VIEW IF EXISTS cell_connectivity",
+            "DROP VIEW IF EXISTS cell_type_interactions",
+            "DROP VIEW IF EXISTS spatial_analysis",
+            "DROP TABLE IF EXISTS neighbors",
+            "DROP TABLE IF EXISTS cells",
+            "DROP TABLE IF EXISTS metadata",
+        ):
+            duckdb_conn.execute(stmt)
+
+        duckdb_conn.execute("""
+            CREATE TABLE cells (
+                cell_id INTEGER PRIMARY KEY,
+                cell_type VARCHAR,
+                centroid_x DOUBLE,
+                centroid_y DOUBLE,
+                centroid_z DOUBLE
+            )
+        """)
+
+        duckdb_conn.register("df_cells", df_cells)
+        duckdb_conn.execute("INSERT INTO cells SELECT * FROM df_cells")
+        duckdb_conn.execute("""
+            CREATE TABLE neighbors (
+                pair_id INTEGER PRIMARY KEY,
+                cell_id_a INTEGER,
+                cell_id_b INTEGER,
+                cell_type_a VARCHAR,
+                cell_type_b VARCHAR,
+                FOREIGN KEY (cell_id_a) REFERENCES cells(cell_id),
+                FOREIGN KEY (cell_id_b) REFERENCES cells(cell_id)
+            )
+        """)
+
+        duckdb_conn.register("df_neighbors", df_neighbors)
+        duckdb_conn.execute("INSERT INTO neighbors SELECT * FROM df_neighbors")
+        print("Creating analytical views for graph queries...")
+
+        duckdb_conn.execute("""
+            CREATE VIEW cell_connectivity AS
+            SELECT 
+                c.cell_id,
+                c.cell_type,
+                c.centroid_x,
+                c.centroid_y,
+                c.centroid_z,
+                COUNT(n1.cell_id_b) + COUNT(n2.cell_id_a) as total_neighbors,
+                COUNT(DISTINCT n1.cell_id_b) + COUNT(DISTINCT n2.cell_id_a) as unique_neighbors
+            FROM cells c
+            LEFT JOIN neighbors n1 ON c.cell_id = n1.cell_id_a
+            LEFT JOIN neighbors n2 ON c.cell_id = n2.cell_id_b
+            GROUP BY c.cell_id, c.cell_type, c.centroid_x, c.centroid_y, c.centroid_z
+        """)
+
+        duckdb_conn.execute("""
+            CREATE VIEW cell_type_interactions AS
+            SELECT 
+                cell_type_a,
+                cell_type_b,
+                COUNT(*) as interaction_count,
+                COUNT(*) * 100.0 / (SELECT COUNT(*) FROM neighbors) as percentage
+            FROM neighbors
+            GROUP BY cell_type_a, cell_type_b
+            ORDER BY interaction_count DESC
+        """)
+
+        duckdb_conn.execute("""
+            CREATE VIEW spatial_analysis AS
+            SELECT 
+                n.pair_id,
+                n.cell_id_a,
+                n.cell_id_b,
+                n.cell_type_a,
+                n.cell_type_b,
+                c1.centroid_x as x_a,
+                c1.centroid_y as y_a,
+                c1.centroid_z as z_a,
+                c2.centroid_x as x_b,
+                c2.centroid_y as y_b,
+                c2.centroid_z as z_b,
+                SQRT(
+                    POWER(c1.centroid_x - c2.centroid_x, 2) +
+                    POWER(c1.centroid_y - c2.centroid_y, 2) +
+                    POWER(c1.centroid_z - c2.centroid_z, 2)
+                ) as euclidean_distance
+            FROM neighbors n
+            JOIN cells c1 ON n.cell_id_a = c1.cell_id
+            JOIN cells c2 ON n.cell_id_b = c2.cell_id
+        """)
+
+        duckdb_conn.execute("""
+            CREATE TABLE metadata (
+                key VARCHAR,
+                value VARCHAR
+            )
+        """)
+
+        metadata = [
+            ('total_cells', str(len(df_cells))),
+            ('total_edges', str(len(df_neighbors))),
+            ('unique_cell_types', str(df_cells['cell_type'].nunique())),
+            ('export_timestamp', pd.Timestamp.now().isoformat()),
+            ('database_type', 'cell_neighbor_graph'),
+            ('format', 'duckdb')
+        ]
+
+        for key, value in metadata:
+            duckdb_conn.execute("INSERT INTO metadata VALUES (?, ?)", [key, value])
+
+        print(f"DuckDB export completed: {output_file}")
+        print(f"  - {len(df_cells)} cells (nodes)")
+        print(f"  - {len(df_neighbors)} neighbor pairs (edges)")
+        print(f"  - Analytical views created for graph analysis")
+        print(f"  - Metadata table populated")
+
+        print("\nExample DuckDB queries:")
+        print("1. Cell connectivity: SELECT * FROM cell_connectivity ORDER BY total_neighbors DESC LIMIT 10")
+        print("2. Cell type interactions: SELECT * FROM cell_type_interactions")
+        print("3. Spatial analysis: SELECT * FROM spatial_analysis WHERE euclidean_distance < 10 LIMIT 10")
+        print("4. Graph statistics: SELECT * FROM metadata")
+    except Exception as e:
+        print(
+            f"Warning: DuckDB export failed (non-fatal; SQLite/CSV/pickle outputs are unchanged): {e}"
         )
-    """)
-    
-    duckdb_conn.execute("INSERT INTO cells SELECT * FROM df_cells")
-    duckdb_conn.execute("""
-        CREATE TABLE neighbors (
-            pair_id INTEGER PRIMARY KEY,
-            cell_id_a INTEGER,
-            cell_id_b INTEGER,
-            cell_type_a VARCHAR,
-            cell_type_b VARCHAR,
-            FOREIGN KEY (cell_id_a) REFERENCES cells(cell_id),
-            FOREIGN KEY (cell_id_b) REFERENCES cells(cell_id)
-        )
-    """)
-    
-    duckdb_conn.execute("INSERT INTO neighbors SELECT * FROM df_neighbors")
-    print("Creating analytical views for graph queries...")
-    
-    duckdb_conn.execute("""
-        CREATE VIEW cell_connectivity AS
-        SELECT 
-            c.cell_id,
-            c.cell_type,
-            c.centroid_x,
-            c.centroid_y,
-            c.centroid_z,
-            COUNT(n1.cell_id_b) + COUNT(n2.cell_id_a) as total_neighbors,
-            COUNT(DISTINCT n1.cell_id_b) + COUNT(DISTINCT n2.cell_id_a) as unique_neighbors
-        FROM cells c
-        LEFT JOIN neighbors n1 ON c.cell_id = n1.cell_id_a
-        LEFT JOIN neighbors n2 ON c.cell_id = n2.cell_id_b
-        GROUP BY c.cell_id, c.cell_type, c.centroid_x, c.centroid_y, c.centroid_z
-    """)
-    
-    duckdb_conn.execute("""
-        CREATE VIEW cell_type_interactions AS
-        SELECT 
-            cell_type_a,
-            cell_type_b,
-            COUNT(*) as interaction_count,
-            COUNT(*) * 100.0 / (SELECT COUNT(*) FROM neighbors) as percentage
-        FROM neighbors
-        GROUP BY cell_type_a, cell_type_b
-        ORDER BY interaction_count DESC
-    """)
-    
-    duckdb_conn.execute("""
-        CREATE VIEW spatial_analysis AS
-        SELECT 
-            n.pair_id,
-            n.cell_id_a,
-            n.cell_id_b,
-            n.cell_type_a,
-            n.cell_type_b,
-            c1.centroid_x as x_a,
-            c1.centroid_y as y_a,
-            c1.centroid_z as z_a,
-            c2.centroid_x as x_b,
-            c2.centroid_y as y_b,
-            c2.centroid_z as z_b,
-            SQRT(
-                POWER(c1.centroid_x - c2.centroid_x, 2) +
-                POWER(c1.centroid_y - c2.centroid_y, 2) +
-                POWER(c1.centroid_z - c2.centroid_z, 2)
-            ) as euclidean_distance
-        FROM neighbors n
-        JOIN cells c1 ON n.cell_id_a = c1.cell_id
-        JOIN cells c2 ON n.cell_id_b = c2.cell_id
-    """)
-    
-    duckdb_conn.execute("""
-        CREATE TABLE metadata (
-            key VARCHAR,
-            value VARCHAR
-        )
-    """)
-    
-    metadata = [
-        ('total_cells', str(len(df_cells))),
-        ('total_edges', str(len(df_neighbors))),
-        ('unique_cell_types', str(df_cells['cell_type'].nunique())),
-        ('export_timestamp', pd.Timestamp.now().isoformat()),
-        ('database_type', 'cell_neighbor_graph'),
-        ('format', 'duckdb')
-    ]
-    
-    for key, value in metadata:
-        duckdb_conn.execute("INSERT INTO metadata VALUES (?, ?)", [key, value])
-    
-    duckdb_conn.close()
-    
-    print(f"DuckDB export completed: {output_file}")
-    print(f"  - {len(df_cells)} cells (nodes)")
-    print(f"  - {len(df_neighbors)} neighbor pairs (edges)")
-    print(f"  - Analytical views created for graph analysis")
-    print(f"  - Metadata table populated")
-    
-    print("\nExample DuckDB queries:")
-    print("1. Cell connectivity: SELECT * FROM cell_connectivity ORDER BY total_neighbors DESC LIMIT 10")
-    print("2. Cell type interactions: SELECT * FROM cell_type_interactions")
-    print("3. Spatial analysis: SELECT * FROM spatial_analysis WHERE euclidean_distance < 10 LIMIT 10")
-    print("4. Graph statistics: SELECT * FROM metadata")
+        traceback.print_exc()
+    finally:
+        if duckdb_conn is not None:
+            try:
+                duckdb_conn.close()
+            except Exception:
+                pass
 
 def get_graph_statistics(conn: sqlite3.Connection) -> Dict[str, Any]:
     # Count nodes (cells)
@@ -1045,36 +1099,58 @@ def build_cell_graph_database_3d(
         neighbor_pairs = touching_neighbor_data
     
     if neighbor_pairs:
-        cursor = conn.cursor()
-        neighbor_data = []
+        seen_pairs = set()
+        deduped = []
         for n in neighbor_pairs:
-            neighbor_data.append((
-                n['cell_id_a'], 
-                n['cell_id_b'], 
-                n['cell_type_a'], 
-                n['cell_type_b']
-            ))
-        
+            key = (int(n["cell_id_a"]), int(n["cell_id_b"]))
+            if key in seen_pairs:
+                continue
+            seen_pairs.add(key)
+            deduped.append(n)
+        neighbor_pairs = deduped
+
+        cursor = conn.cursor()
+        neighbor_data = [
+            (
+                pair_id,
+                n["cell_id_a"],
+                n["cell_id_b"],
+                n["cell_type_a"],
+                n["cell_type_b"],
+            )
+            for pair_id, n in enumerate(neighbor_pairs, start=1)
+        ]
+
         try:
             cursor.executemany(
-                "INSERT INTO neighbors (cell_id_a, cell_id_b, cell_type_a, cell_type_b) VALUES (?, ?, ?, ?)", 
-                neighbor_data
+                "INSERT INTO neighbors (pair_id, cell_id_a, cell_id_b, cell_type_a, cell_type_b) VALUES (?, ?, ?, ?, ?)",
+                neighbor_data,
             )
             conn.commit()
             print(f"Successfully inserted {len(neighbor_pairs)} neighbor pairs into database")
         except sqlite3.IntegrityError as e:
             if "UNIQUE constraint failed" in str(e):
-                print(f"Warning: Some duplicate pairs were found and skipped due to UNIQUE constraint")
+                print(
+                    "Warning: UNIQUE constraint on insert; inserting sequentially and skipping duplicate edges"
+                )
+                next_id = 1
                 inserted_count = 0
-                for data in neighbor_data:
+                for n in neighbor_pairs:
                     try:
                         cursor.execute(
-                            "INSERT INTO neighbors (cell_id_a, cell_id_b, cell_type_a, cell_type_b) VALUES (?, ?, ?, ?)", 
-                            data
+                            "INSERT INTO neighbors (pair_id, cell_id_a, cell_id_b, cell_type_a, cell_type_b) VALUES (?, ?, ?, ?, ?)",
+                            (
+                                next_id,
+                                n["cell_id_a"],
+                                n["cell_id_b"],
+                                n["cell_type_a"],
+                                n["cell_type_b"],
+                            ),
                         )
+                        next_id += 1
                         inserted_count += 1
                     except sqlite3.IntegrityError:
-                        continue  # Skip duplicates
+                        continue
                 conn.commit()
                 print(f"Successfully inserted {inserted_count} unique neighbor pairs into database")
             else:
@@ -1114,7 +1190,7 @@ def build_cell_graph_database_3d(
     
     if save_graph_state_pickle:
         print(f"Saving complete graph state to: {save_graph_state_pickle}")
-        df_neighbors = pd.read_sql_query("SELECT * FROM neighbors", conn)
+        df_neighbors = pd.read_sql_query("SELECT * FROM neighbors ORDER BY pair_id", conn)
         neighbor_pairs = df_neighbors.to_dict('records')
         
         parameters = {
@@ -1263,18 +1339,15 @@ def create_neighbor_edge_table_database_3d(
     
     # Export to CSV
     if output_csv:
-        df_neighbors = pd.read_sql_query("SELECT * FROM neighbors", conn)
+        df_neighbors = pd.read_sql_query("SELECT * FROM neighbors ORDER BY pair_id", conn)
         df_neighbors.to_csv(output_csv, index=False)
         print(f"Neighbor edge table saved to: {output_csv}")
     
-    # Export to AnnData
+    # Optional AnnData / DuckDB (failures are non-fatal; SQLite + CSV + pickles already written)
     if output_anndata:
-        adata = export_to_anndata(conn, output_anndata)
-        if adata is not None:
-            print(f"AnnData object created and saved to: {output_anndata}")
-    
-    # Export to DuckDB (default)
+        export_to_anndata(conn, output_anndata)
+
     duckdb_output = db_path.replace('.db', '.duckdb')
     export_to_duckdb(conn, duckdb_output)
-    
+
     return conn

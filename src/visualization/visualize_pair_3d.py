@@ -1,82 +1,291 @@
 import argparse
 import sqlite3
 import sys
-import pickle
 import os
 from pathlib import Path
-from typing import Tuple, Dict
+from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import zarr
 
-def _load_segmentation_labels(seg_zarr_path: str):
-    zg = zarr.open(seg_zarr_path, mode="r")
+try:
+    from zarr.hierarchy import Group as ZarrGroup
+except ImportError:
+    ZarrGroup = zarr.Group
 
-    if "labels" in zg:
-        arr = zg["labels"]
-        if arr.ndim == 5:
-            return arr[0, 0]
-        return arr
 
-    if "0" in zg and isinstance(zg["0"], zarr.hierarchy.Group) and "0" in zg["0"]:
-        arr = zg["0"]["0"]
-        if arr.ndim == 5:
-            return arr[0, 0]
-        return arr
+def _interscellar_zarr_stem(interscellar_zarr_path: str) -> str:
+    base = os.path.splitext(os.path.basename(interscellar_zarr_path))[0]
+    while base.endswith("_interscellar_volumes"):
+        base = base[: -len("_interscellar_volumes")]
+    return base
 
-    for k in zg.keys():
-        node = zg[k]
-        if hasattr(node, "ndim") and node.ndim >= 3:
-            return node
-    raise RuntimeError("Could not find a 3D labels array in segmentation zarr")
-
-def _tight_bbox(mask: np.ndarray, pad: int = 2):
-    coords = np.argwhere(mask)
-    if coords.size == 0:
-        return (slice(0, mask.shape[0]), slice(0, mask.shape[1]), slice(0, mask.shape[2]))
-    zmin, ymin, xmin = coords.min(axis=0)
-    zmax, ymax, xmax = coords.max(axis=0)
-    zmin = max(0, zmin - pad)
-    ymin = max(0, ymin - pad)
-    xmin = max(0, xmin - pad)
-    zmax = min(mask.shape[0], zmax + pad + 1)
-    ymax = min(mask.shape[1], ymax + pad + 1)
-    xmax = min(mask.shape[2], xmax + pad + 1)
-    return (slice(zmin, zmax), slice(ymin, ymax), slice(xmin, xmax))
 
 def _find_file(filename, description, script_dir):
     possible_paths = [
-        filename, 
+        filename,
         Path(script_dir) / filename,
         Path(".") / filename,
         Path(script_dir).parent / filename,
     ]
-    
+
     for path in possible_paths:
         path_obj = Path(path)
         if path_obj.exists():
             return str(path_obj.resolve())
-    
+
     raise FileNotFoundError(
         f"{description} not found: {filename}\n"
-        f"Checked locations:\n" +
-        "\n".join(f"    - {p}" for p in possible_paths)
+        f"Checked locations:\n" + "\n".join(f"    - {p}" for p in possible_paths)
     )
+
+
+def _cell_only_3d_view(zroot) -> object:
+    if "labels" in zroot:
+        arr = zroot["labels"]
+    elif "0" in zroot:
+        if isinstance(zroot["0"], ZarrGroup) and "0" in zroot["0"]:
+            arr = zroot["0"]["0"]
+        else:
+            arr = zroot["0"]
+    else:
+        for key in zroot.keys():
+            node = zroot[key]
+            if hasattr(node, "ndim") and node.ndim >= 3:
+                arr = node
+                print(f"  Using cell-only key '{key}'")
+                break
+        else:
+            raise RuntimeError(
+                f"Could not find labels in cell-only zarr. Keys: {list(zroot.keys())}"
+            )
+
+    if arr.ndim == 5:
+        return arr[0, 0]
+    return arr
+
+
+def _try_pair_from_interscellar_db(conn: sqlite3.Connection, pair_id: int) -> Optional[Tuple[int, int]]:
+    cur = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='interscellar_volumes'"
+    )
+    if not cur.fetchone():
+        return None
+    row = conn.execute(
+        "SELECT cell_a_id, cell_b_id FROM interscellar_volumes WHERE pair_id=?",
+        (pair_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return int(row[0]), int(row[1])
+
+
+def _try_pair_from_neighbors_db(conn: sqlite3.Connection, pair_id: int) -> Optional[Tuple[int, int]]:
+    cur = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='neighbors'"
+    )
+    if not cur.fetchone():
+        return None
+    row = conn.execute(
+        "SELECT cell_id_a, cell_id_b FROM neighbors WHERE pair_id=?",
+        (pair_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return int(row[0]), int(row[1])
+
+
+def resolve_pair_cell_ids(
+    pair_id: int,
+    zarr_dir: str,
+    stem: str,
+    explicit_db: Optional[str],
+) -> Tuple[int, int]:
+    tried = []
+    db_candidates = []
+    if explicit_db and os.path.exists(explicit_db):
+        db_candidates.append(explicit_db)
+
+    for name in (
+        f"{stem}_interscellar_volumes.db",
+        f"{stem}_neighbor_graph.db",
+    ):
+        p = os.path.join(zarr_dir, name)
+        if p not in db_candidates and os.path.exists(p):
+            db_candidates.append(p)
+
+    for db_path in db_candidates:
+        tried.append(db_path)
+        conn = sqlite3.connect(db_path)
+        try:
+            pair = _try_pair_from_interscellar_db(conn, pair_id)
+            if pair is not None:
+                print(f"Resolved pair_id {pair_id} from interscellar_volumes: {db_path}")
+                return pair
+            pair = _try_pair_from_neighbors_db(conn, pair_id)
+            if pair is not None:
+                print(f"Resolved pair_id {pair_id} from neighbors graph: {db_path}")
+                return pair
+        finally:
+            conn.close()
+
+    csv_path = os.path.join(zarr_dir, f"{stem}_volumes.csv")
+    if os.path.exists(csv_path):
+        tried.append(csv_path)
+        df = pd.read_csv(csv_path)
+        if "pair_id" not in df.columns:
+            raise RuntimeError(f"CSV missing pair_id column: {csv_path}")
+        sub = df[df["pair_id"] == pair_id]
+        if len(sub) == 0:
+            pmin, pmax = int(df["pair_id"].min()), int(df["pair_id"].max())
+            raise RuntimeError(
+                f"pair_id {pair_id} not in {csv_path}. Valid range [{pmin}, {pmax}], n={len(df)}"
+            )
+        row = sub.iloc[0]
+        print(f"Resolved pair_id {pair_id} from CSV: {csv_path}")
+        return int(row["cell_a_id"]), int(row["cell_b_id"])
+
+    raise RuntimeError(
+        f"Could not resolve pair_id {pair_id} to cell IDs. Tried DBs/CSV under {zarr_dir} "
+        f"(stem={stem!r}). Provide --db pointing to interscellar_volumes.db or neighbor_graph.db, "
+        f"or ensure {stem}_volumes.csv exists."
+    )
+
+
+def _bbox_from_mesh_pair_id(mesh, pair_id: int, pad: int) -> Optional[Tuple[slice, slice, slice]]:
+    """Scan z-slabs (no full 3D load) for voxels equal to pair_id."""
+    nz, ny, nx = mesh.shape
+    z_min, z_max = None, None
+    y_min, y_max = ny, -1
+    x_min, x_max = nx, -1
+
+    for zi in range(nz):
+        slab = np.asarray(mesh[zi, :, :])
+        m = slab == pair_id
+        if not np.any(m):
+            continue
+        ys, xs = np.where(m)
+        if z_min is None:
+            z_min = zi
+        z_max = zi
+        y_min = min(y_min, int(ys.min()))
+        y_max = max(y_max, int(ys.max()))
+        x_min = min(x_min, int(xs.min()))
+        x_max = max(x_max, int(xs.max()))
+
+    if z_min is None:
+        return None
+
+    return (
+        slice(max(0, z_min - pad), min(nz, z_max + pad + 1)),
+        slice(max(0, y_min - pad), min(ny, y_max + pad + 1)),
+        slice(max(0, x_min - pad), min(nx, x_max + pad + 1)),
+    )
+
+
+def _bbox_from_cell_ids(vol, cell_a: int, cell_b: int, pad: int) -> Optional[Tuple[slice, slice, slice]]:
+    nz, ny, nx = vol.shape
+    z_min, z_max = None, None
+    y_min, y_max = ny, -1
+    x_min, x_max = nx, -1
+
+    for zi in range(nz):
+        slab = np.asarray(vol[zi, :, :])
+        m = (slab == cell_a) | (slab == cell_b)
+        if not np.any(m):
+            continue
+        ys, xs = np.where(m)
+        if z_min is None:
+            z_min = zi
+        z_max = zi
+        y_min = min(y_min, int(ys.min()))
+        y_max = max(y_max, int(ys.max()))
+        x_min = min(x_min, int(xs.min()))
+        x_max = max(x_max, int(xs.max()))
+
+    if z_min is None:
+        return None
+
+    return (
+        slice(max(0, z_min - pad), min(nz, z_max + pad + 1)),
+        slice(max(0, y_min - pad), min(ny, y_max + pad + 1)),
+        slice(max(0, x_min - pad), min(nx, x_max + pad + 1)),
+    )
+
+
+def _union_slices(
+    a: Optional[Tuple[slice, slice, slice]],
+    b: Optional[Tuple[slice, slice, slice]],
+    shape: Tuple[int, int, int],
+) -> Optional[Tuple[slice, slice, slice]]:
+    if a is None:
+        return b
+    if b is None:
+        return a
+    nz, ny, nx = shape
+    return (
+        slice(max(0, min(a[0].start, b[0].start)), min(nz, max(a[0].stop, b[0].stop))),
+        slice(max(0, min(a[1].start, b[1].start)), min(ny, max(a[1].stop, b[1].stop))),
+        slice(max(0, min(a[2].start, b[2].start)), min(nx, max(a[2].stop, b[2].stop))),
+    )
+
 
 def main():
     script_dir = Path(__file__).parent.resolve()
-    
-    p = argparse.ArgumentParser(description="Visualize one interscellar pair in napari")
-    p.add_argument("--pair-id", type=int, required=True, help="Pair ID to visualize")
-    p.add_argument("--cell-only-zarr", required=True,
-                   help="Path to cell-only volumes zarr file")
-    p.add_argument("--interscellar-zarr", required=True,
-                   help="Path to interscellar volumes zarr file (contains 'interscellar_meshes')")
-    p.add_argument("--db", required=False, default=None,
-                   help="SQLite DB with interscellar_volumes table (to map pair->cell IDs).")
-    p.add_argument("--pair-opacity", type=float, default=0.6, help="Opacity for the interscellar volume layer")
-    p.add_argument("--cells-opacity", type=float, default=0.7, help="Opacity for the cell-only layers")
+
+    p = argparse.ArgumentParser(
+        description=(
+            "Visualize one interscellar pair in napari using unified pair_id "
+            "(same as interscellar_meshes labels and interscellar_volumes.db)."
+        )
+    )
+    p.add_argument(
+        "--pair-id",
+        type=int,
+        required=True,
+        help="Unified pair_id (matches interscellar mesh voxel labels and DB/CSV)",
+    )
+    p.add_argument(
+        "--cell-only-zarr",
+        required=True,
+        help="Path to cell-only volumes zarr file",
+    )
+    p.add_argument(
+        "--interscellar-zarr",
+        required=True,
+        help="Path to interscellar volumes zarr (contains 'interscellar_meshes')",
+    )
+    p.add_argument(
+        "--db",
+        required=False,
+        default=None,
+        help="Optional SQLite DB (interscellar_volumes or neighbor_graph); auto-detected if omitted",
+    )
+    p.add_argument(
+        "--pair-opacity",
+        type=float,
+        default=0.6,
+        help="Opacity for the interscellar volume layer",
+    )
+    p.add_argument(
+        "--cells-opacity",
+        type=float,
+        default=0.7,
+        help="Opacity for the two cell-only layers",
+    )
+    p.add_argument(
+        "--bbox-pad",
+        type=int,
+        default=10,
+        help="Padding voxels around the union bbox for interscellar + two cells",
+    )
+    p.add_argument(
+        "--show-all-cell-labels-in-crop",
+        action="store_true",
+        help="Add a low-opacity layer with all label IDs in the cropped region",
+    )
+
     args = p.parse_args()
 
     try:
@@ -85,246 +294,139 @@ def main():
     except FileNotFoundError as e:
         print(f"Error: {e}")
         sys.exit(1)
-    
-    db_path_str = None
-    if args.db is None:
-        zarr_dir = os.path.dirname(interscellar_zarr_path) if os.path.dirname(interscellar_zarr_path) else "."
-        zarr_basename = os.path.basename(interscellar_zarr_path)
-        base_name = os.path.splitext(zarr_basename)[0]
-        while base_name.endswith('_interscellar_volumes'):
-            base_name = base_name[:-len('_interscellar_volumes')]
-        possible_db = os.path.join(zarr_dir, f"{base_name}_interscellar_volumes.db")
-        if os.path.exists(possible_db):
-            db_path_str = possible_db
-            print(f"Auto-detected database: {db_path_str}")
-        else:
-            possible_csv = os.path.join(zarr_dir, f"{base_name}_volumes.csv")
-            if os.path.exists(possible_csv):
-                db_path_str = None  # Will use CSV directly
-                print(f"Auto-detected CSV file: {possible_csv}")
-            else:
-                print(f"Warning: Could not auto-detect database or CSV. Will try to find CSV in directory.")
-                db_path_str = None
-    else:
+
+    zarr_dir = os.path.dirname(interscellar_zarr_path) or "."
+    stem = _interscellar_zarr_stem(interscellar_zarr_path)
+
+    explicit_db = None
+    if args.db:
         try:
-            db_path_str = _find_file(args.db, "Database", script_dir)
+            explicit_db = _find_file(args.db, "Database", script_dir)
         except FileNotFoundError as e:
-            print(f"Warning: {e}")
-            db_path_str = None
-    
-    print(f"Loading cell-only zarr: {cell_only_zarr_path}")
-    cell_only_zarr = zarr.open(cell_only_zarr_path, mode='r')
-    
-    cell_only_labels = None
-    if 'labels' in cell_only_zarr:
-        cell_only_labels = cell_only_zarr['labels']
-    elif '0' in cell_only_zarr:
-        if isinstance(cell_only_zarr['0'], zarr.hierarchy.Group):
-            if '0' in cell_only_zarr['0']:
-                cell_only_labels = cell_only_zarr['0']['0']
-            else:
-                print(f"Error: Unexpected zarr structure in cell-only zarr")
-                sys.exit(1)
-        else:
-            cell_only_labels = cell_only_zarr['0']
-    else:
-        found = False
-        for key in cell_only_zarr.keys():
-            node = cell_only_zarr[key]
-            if hasattr(node, 'ndim') and node.ndim >= 3:
-                cell_only_labels = node
-                found = True
-                print(f"Found data in key '{key}'")
-                break
-        if not found:
-            print(f"Error: Could not find data in cell-only zarr")
-            print(f"Available keys: {list(cell_only_zarr.keys())}")
+            print(f"Error: {e}")
             sys.exit(1)
-    
-    if cell_only_labels.ndim == 5:
-        cell_only_3d = cell_only_labels[0, 0]
-    else:
-        cell_only_3d = cell_only_labels
-    
-    print(f"Cell-only volumes shape: {cell_only_3d.shape}")
-    
-    print(f"Loading interscellar zarr: {interscellar_zarr_path}")
-    interscellar_zarr = zarr.open(interscellar_zarr_path, mode='r')
-    if 'interscellar_meshes' not in interscellar_zarr:
-        print(f"Error: 'interscellar_meshes' dataset not found in {interscellar_zarr_path}")
+
+    try:
+        cell_a_id, cell_b_id = resolve_pair_cell_ids(
+            args.pair_id, zarr_dir, stem, explicit_db
+        )
+    except RuntimeError as e:
+        print(f"Error: {e}")
         sys.exit(1)
-    interscellar_mesh = interscellar_zarr['interscellar_meshes']
-    
-    print(f"Interscellar volumes shape: {interscellar_mesh.shape}")
-    
+
+    print(f"Pair {args.pair_id}: cell_a_id={cell_a_id}, cell_b_id={cell_b_id}")
+
+    print(f"Opening zarr stores (lazy)...")
+    cell_only_zarr = zarr.open(cell_only_zarr_path, mode="r")
+    interscellar_zarr = zarr.open(interscellar_zarr_path, mode="r")
+
+    if "interscellar_meshes" not in interscellar_zarr:
+        print(f"Error: 'interscellar_meshes' not found in {interscellar_zarr_path}")
+        sys.exit(1)
+
+    cell_only_3d = _cell_only_3d_view(cell_only_zarr)
+    interscellar_mesh = interscellar_zarr["interscellar_meshes"]
+
     if cell_only_3d.shape != interscellar_mesh.shape:
         print("Error: cell-only and interscellar volumes have different shapes.")
-        print(f"  cell-only shape:  {cell_only_3d.shape}")
-        print(f"  interscellar shape: {interscellar_mesh.shape}")
+        print(f"  cell-only:  {cell_only_3d.shape}")
+        print(f"  interscellar: {interscellar_mesh.shape}")
         sys.exit(1)
 
-    print(f"Loading cell IDs for pair {args.pair_id}...")
-    cell_a_id, cell_b_id = None, None
-    
-    if db_path_str and os.path.exists(db_path_str):
-        print(f"Loading from database: {db_path_str}")
-        conn = sqlite3.connect(db_path_str)
-        try:
-            row = conn.execute(
-                "SELECT cell_a_id, cell_b_id FROM interscellar_volumes WHERE pair_id=?",
-                (args.pair_id,)
-            ).fetchone()
-            
-            count = conn.execute("SELECT COUNT(*) FROM interscellar_volumes").fetchone()[0]
-            
-            if row is not None:
-                cell_a_id, cell_b_id = int(row[0]), int(row[1])
-            elif count == 0:
-                print(f"Database is empty, trying CSV file as fallback...")
-                csv_path = db_path_str.replace('.db', '.csv')
-                if os.path.exists(csv_path):
-                    df = pd.read_csv(csv_path)
-                    pair_data = df[df['pair_id'] == args.pair_id]
-                    if len(pair_data) > 0:
-                        cell_a_id = int(pair_data.iloc[0]['cell_a_id'])
-                        cell_b_id = int(pair_data.iloc[0]['cell_b_id'])
-                        print(f"Found pair in CSV: {csv_path}")
-        finally:
-            conn.close()
-    
-    if cell_a_id is None or cell_b_id is None:
-        zarr_dir = os.path.dirname(interscellar_zarr_path) if os.path.dirname(interscellar_zarr_path) else "."
-        zarr_basename = os.path.basename(interscellar_zarr_path)
-        base_name = os.path.splitext(zarr_basename)[0]
-        while base_name.endswith('_interscellar_volumes'):
-            base_name = base_name[:-len('_interscellar_volumes')]
-        csv_path = os.path.join(zarr_dir, f"{base_name}_volumes.csv")
-        if os.path.exists(csv_path):
-            print(f"Trying CSV file: {csv_path}")
-            df = pd.read_csv(csv_path)
-            pair_data = df[df['pair_id'] == args.pair_id]
-            if len(pair_data) > 0:
-                cell_a_id = int(pair_data.iloc[0]['cell_a_id'])
-                cell_b_id = int(pair_data.iloc[0]['cell_b_id'])
-                print(f"Found pair in CSV: {csv_path}")
-            else:
-                if len(df) > 0:
-                    min_id = df['pair_id'].min()
-                    max_id = df['pair_id'].max()
-                    print(f"Pair {args.pair_id} not found in CSV. Valid range: [{min_id}, {max_id}], Total: {len(df)}")
-    
-    if cell_a_id is None or cell_b_id is None:
-        print(f"\nError: pair_id {args.pair_id} not found in database or CSV")
-        print(f"Please provide --db or ensure CSV file exists in the same directory as interscellar-zarr")
-        sys.exit(1)
-    
-    print(f"Pair {args.pair_id}: Cell A={cell_a_id}, Cell B={cell_b_id}")
+    print(
+        f"Computing crop from unified pair_id={args.pair_id} (z-slab scan; full volume not loaded)..."
+    )
+    pad = args.bbox_pad
+    bbox_mesh = _bbox_from_mesh_pair_id(interscellar_mesh, args.pair_id, pad)
+    bbox_cells = _bbox_from_cell_ids(cell_only_3d, cell_a_id, cell_b_id, pad)
+    union_bbox = _union_slices(bbox_mesh, bbox_cells, cell_only_3d.shape)
 
-    print("Finding bounding box for pair region...")
-    
-    cell_only_array = np.asarray(cell_only_3d)
-    interscellar_array = np.asarray(interscellar_mesh)
-    
-    print(f"Searching for pair_id {args.pair_id} in interscellar volumes...")
-    pair_coords = np.argwhere(interscellar_array == args.pair_id)
-    
-    if pair_coords.size == 0:
-        print(f"Warning: pair_id {args.pair_id} not found in interscellar volumes")
-
-        cell_a_coords = np.argwhere(cell_only_array == cell_a_id)
-        cell_b_coords = np.argwhere(cell_only_array == cell_b_id)
-        
-        if cell_a_coords.size == 0 and cell_b_coords.size == 0:
-            print(f"Error: Neither cell A={cell_a_id} nor cell B={cell_b_id} found in cell-only volumes")
-            sys.exit(1)
-        
-        all_coords = []
-        if cell_a_coords.size > 0:
-            all_coords.append(cell_a_coords)
-        if cell_b_coords.size > 0:
-            all_coords.append(cell_b_coords)
-        
-        if len(all_coords) > 0:
-            all_cell_coords = np.vstack(all_coords)
-            z_min, y_min, x_min = all_cell_coords.min(axis=0)
-            z_max, y_max, x_max = all_cell_coords.max(axis=0)
-            pad = 10
-            union_bbox = (
-                slice(max(0, z_min - pad), min(cell_only_array.shape[0], z_max + pad + 1)),
-                slice(max(0, y_min - pad), min(cell_only_array.shape[1], y_max + pad + 1)),
-                slice(max(0, x_min - pad), min(cell_only_array.shape[2], x_max + pad + 1))
-            )
-            print(f"Using bounding box from cell-only volumes with padding")
-        else:
-            print(f"Error: Could not determine bounding box")
-            sys.exit(1)
-    else:
-        cell_a_coords = np.argwhere(cell_only_array == cell_a_id)
-        cell_b_coords = np.argwhere(cell_only_array == cell_b_id)
-        
-        all_coords_list = [pair_coords]
-        if cell_a_coords.size > 0:
-            all_coords_list.append(cell_a_coords)
-        if cell_b_coords.size > 0:
-            all_coords_list.append(cell_b_coords)
-        
-        all_coords = np.vstack(all_coords_list)
-        z_min, y_min, x_min = all_coords.min(axis=0)
-        z_max, y_max, x_max = all_coords.max(axis=0)
-        
-        pad = 10
-        union_bbox = (
-            slice(max(0, z_min - pad), min(cell_only_array.shape[0], z_max + pad + 1)),
-            slice(max(0, y_min - pad), min(cell_only_array.shape[1], y_max + pad + 1)),
-            slice(max(0, x_min - pad), min(cell_only_array.shape[2], x_max + pad + 1))
+    if union_bbox is None:
+        print(
+            f"Error: pair_id {args.pair_id} not in interscellar mesh and cells "
+            f"{cell_a_id}, {cell_b_id} not found in cell-only volume."
         )
-        print(f"Found {len(pair_coords)} voxels for pair_id {args.pair_id}")
-    
-    print(f"Union bbox: z=[{union_bbox[0].start}:{union_bbox[0].stop}], "
-          f"y=[{union_bbox[1].start}:{union_bbox[1].stop}], "
-          f"x=[{union_bbox[2].start}:{union_bbox[2].stop}]")
-    print(f"Region size: {union_bbox[0].stop - union_bbox[0].start} x "
-          f"{union_bbox[1].stop - union_bbox[1].start} x "
-          f"{union_bbox[2].stop - union_bbox[2].start} voxels")
-    
-    print("Extracting region from volumes...")
-    cell_only_region = cell_only_array[union_bbox]
-    interscellar_region = interscellar_array[union_bbox]
-    
-    pair_mask = (interscellar_region == args.pair_id)
-    cell_a_mask = (cell_only_region == cell_a_id)
-    cell_b_mask = (cell_only_region == cell_b_id)
-    
-    print(f"Interscellar volume voxels: {pair_mask.sum()}")
-    print(f"Cell A only voxels: {cell_a_mask.sum()}")
-    print(f"Cell B only voxels: {cell_b_mask.sum()}")
-    
-    if pair_mask.sum() == 0:
-        print(f"Warning: No interscellar volume found for pair_id {args.pair_id} in this region")
+        sys.exit(1)
+
+    if bbox_mesh is None:
+        print(
+            f"Warning: no voxels with value pair_id={args.pair_id} in interscellar_meshes; "
+            f"using bbox from cell IDs only."
+        )
+    if bbox_cells is None:
+        print(
+            f"Warning: cell IDs {cell_a_id}, {cell_b_id} not found in cell-only volume; "
+            f"using bbox from interscellar mesh only."
+        )
+
+    print(
+        f"Crop: z=[{union_bbox[0].start}:{union_bbox[0].stop}], "
+        f"y=[{union_bbox[1].start}:{union_bbox[1].stop}], "
+        f"x=[{union_bbox[2].start}:{union_bbox[2].stop}]"
+    )
+    print(
+        f"Region size: {union_bbox[0].stop - union_bbox[0].start} x "
+        f"{union_bbox[1].stop - union_bbox[1].start} x "
+        f"{union_bbox[2].stop - union_bbox[2].start} voxels"
+    )
+
+    print("Loading cropped arrays...")
+    cell_only_region = np.asarray(cell_only_3d[union_bbox])
+    interscellar_region = np.asarray(interscellar_mesh[union_bbox])
+
+    pair_mask = interscellar_region == args.pair_id
+    cell_a_mask = cell_only_region == cell_a_id
+    cell_b_mask = cell_only_region == cell_b_id
+
+    print(f"Interscellar voxels (pair_id={args.pair_id}): {pair_mask.sum()}")
+    print(f"Cell A voxels: {cell_a_mask.sum()}")
+    print(f"Cell B voxels: {cell_b_mask.sum()}")
+
+    if not np.any(pair_mask):
+        print(
+            f"Warning: no interscellar voxels for pair_id in crop; "
+            f"check that pair_id matches mesh labels and DB/CSV."
+        )
 
     try:
         import napari
-    except Exception as e:
+    except Exception:
         print("Error: napari import failed. Install with: pip install 'napari[all]'")
         raise
 
-    v = napari.Viewer(title=f"Pair {args.pair_id}: Cell A={cell_a_id}, Cell B={cell_b_id}")
-    
-    v.add_labels(pair_mask.astype(np.uint8), name=f"interscellar_volume_pair_{args.pair_id}", opacity=args.pair_opacity)
-    
-    v.add_labels(cell_a_mask.astype(np.uint8), name=f"cell_{cell_a_id}_only", opacity=args.cells_opacity)
-    v.add_labels(cell_b_mask.astype(np.uint8), name=f"cell_{cell_b_id}_only", opacity=args.cells_opacity)
-    
-    if args.cells_opacity > 0:
-        v.add_labels(cell_only_region.astype(np.uint32), name="all_cell_only_volumes", opacity=0.2)
+    v = napari.Viewer(title=f"Pair {args.pair_id}: cells {cell_a_id} / {cell_b_id}")
 
-    v.camera.center = (
-        (union_bbox[2].start + union_bbox[2].stop) / 2,
-        (union_bbox[1].start + union_bbox[1].stop) / 2,
+    v.add_labels(
+        pair_mask.astype(np.uint8),
+        name=f"interscellar_pair_{args.pair_id}",
+        opacity=args.pair_opacity,
     )
+    v.add_labels(
+        cell_a_mask.astype(np.uint8),
+        name=f"cell_{cell_a_id}_only",
+        opacity=args.cells_opacity,
+    )
+    v.add_labels(
+        cell_b_mask.astype(np.uint8),
+        name=f"cell_{cell_b_id}_only",
+        opacity=args.cells_opacity,
+    )
+
+    if args.show_all_cell_labels_in_crop:
+        v.add_labels(
+            cell_only_region.astype(np.uint32),
+            name="all_cell_labels_in_crop",
+            opacity=0.2,
+        )
+
+    zc = (union_bbox[0].start + union_bbox[0].stop) / 2
+    yc = (union_bbox[1].start + union_bbox[1].stop) / 2
+    xc = (union_bbox[2].start + union_bbox[2].stop) / 2
+    v.camera.center = (xc, yc)
     v.camera.zoom = 0.8
 
     napari.run()
+
 
 if __name__ == "__main__":
     main()

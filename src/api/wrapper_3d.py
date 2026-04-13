@@ -144,7 +144,7 @@ def find_cell_neighbors_3d(
     neighbor_table_df = None
     if output_csv:
         try:
-            neighbor_table_df = pd.read_sql_query("SELECT * FROM neighbors", conn)
+            neighbor_table_df = pd.read_sql_query("SELECT * FROM neighbors ORDER BY pair_id", conn)
             print(f"Neighbor table: {len(neighbor_table_df)} pairs")
         except Exception as e:
             print(f"Warning: Could not retrieve neighbor table: {e}")
@@ -201,7 +201,8 @@ def compute_interscellar_volumes_3d(
     intracellular_threshold_um: float = 1.0,
     n_jobs: int = 4,
     return_connection: bool = False,
-    intermediate_results_dir: str = "intermediate_interscellar_results"
+    intermediate_results_dir: str = "intermediate_interscellar_results",
+    resume: Optional[bool] = None,
 ) -> Tuple[Optional[pd.DataFrame], Optional[object], Optional[object]]:
     
     print("=" * 60)
@@ -394,7 +395,8 @@ def compute_interscellar_volumes_3d(
             max_distance_um=max_distance_um,
             intracellular_threshold_um=intracellular_threshold_um,
             n_jobs=n_jobs,
-            intermediate_results_dir=intermediate_results_dir
+            intermediate_results_dir=intermediate_results_dir,
+            resume=resume,
         )
         
         print(f"\n3. Verifying mesh zarr completion...")

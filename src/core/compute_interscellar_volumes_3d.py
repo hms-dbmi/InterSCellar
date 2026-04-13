@@ -8,8 +8,43 @@ from scipy.ndimage import label, distance_transform_edt
 import sqlite3
 import os
 import pickle
+import traceback
 import math
 import zarr
+
+try:
+    from zarr.hierarchy import Group as ZarrGroup
+except ImportError:
+    ZarrGroup = zarr.Group
+
+
+def _zarr_gzip_dataset_kwargs(
+    level: int = 6, copy_compressors_from: Any = None
+) -> Dict[str, Any]:
+    if int(zarr.__version__.split(".")[0]) >= 3:
+        from zarr.codecs import GzipCodec
+
+        if copy_compressors_from is not None:
+            comps = getattr(copy_compressors_from, "compressors", None)
+            if comps:
+                return {"compressors": list(comps)}
+        return {"compressors": [GzipCodec(level=level)]}
+    if copy_compressors_from is not None:
+        compression = "gzip"
+        compression_opts: Any = level
+        if getattr(copy_compressors_from, "compression", None):
+            compression = copy_compressors_from.compression
+        if getattr(copy_compressors_from, "compressor", None):
+            compression = copy_compressors_from.compressor.codec_id
+            compression_opts = getattr(
+                copy_compressors_from.compressor, "level", level
+            )
+        co = getattr(copy_compressors_from, "compression_opts", None)
+        if co is not None:
+            compression_opts = co
+        return {"compression": compression, "compression_opts": compression_opts}
+    return {"compression": "gzip", "compression_opts": level}
+
 
 try:
     import anndata as ad
@@ -22,33 +57,41 @@ except ImportError:
 
 ## Data loading
 
+def assign_pair_ids_from_row_order(neighbor_df: pd.DataFrame) -> pd.DataFrame:
+    out = neighbor_df.reset_index(drop=True).copy()
+    out["pair_id"] = np.arange(1, len(out) + 1, dtype=np.int64)
+    return out
+
+
 def load_neighbor_pairs_from_db(db_path: str) -> pd.DataFrame:
-    """Load neighbor pairs from SQLite database (more efficient than CSV)."""
     print(f"Loading neighbor pairs from database: {db_path}")
     conn = sqlite3.connect(db_path)
-    
     cursor = conn.cursor()
     cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='neighbors'")
     if not cursor.fetchone():
         conn.close()
         raise ValueError(f"Database {db_path} does not contain 'neighbors' table")
-    
+
     query = """
-    SELECT 
-        cell_id_a as cell_a_id,
-        cell_id_b as cell_b_id,
-        cell_type_a as cell_a_type,
-        cell_type_b as cell_b_type,
+    SELECT
+        cell_id_a AS cell_a_id,
+        cell_id_b AS cell_b_id,
+        cell_type_a AS cell_a_type,
+        cell_type_b AS cell_b_type,
         surface_distance_um,
         euclidean_distance_um,
         pair_id
     FROM neighbors
     ORDER BY pair_id
     """
-    
     neighbor_df = pd.read_sql_query(query, conn)
     conn.close()
-    
+
+    if "pair_id" not in neighbor_df.columns or neighbor_df["pair_id"].isna().all():
+        neighbor_df = assign_pair_ids_from_row_order(neighbor_df)
+    else:
+        neighbor_df["pair_id"] = neighbor_df["pair_id"].astype(np.int64)
+
     print(f"Loaded {len(neighbor_df)} neighbor pairs from database")
     return neighbor_df
 
@@ -75,8 +118,14 @@ def load_neighbor_pairs_from_csv(csv_path: str) -> pd.DataFrame:
         })
     else:
         raise ValueError(f"Missing cell type columns. Found: {list(neighbor_df.columns)}")
-    
-    print(f"Loaded {len(neighbor_df)} neighbor pairs")
+
+    if "pair_id" not in neighbor_df.columns:
+        neighbor_df = assign_pair_ids_from_row_order(neighbor_df)
+    else:
+        neighbor_df = neighbor_df.sort_values("pair_id").reset_index(drop=True)
+        neighbor_df["pair_id"] = neighbor_df["pair_id"].astype(np.int64)
+
+    print(f"Loaded {len(neighbor_df)} neighbor pairs from CSV")
     return neighbor_df
 
 def load_halo_bboxes_from_pickle(pickle_path: str) -> Dict[int, Tuple[slice, slice, slice]]:
@@ -592,79 +641,77 @@ def compute_interscellar_volumes_for_all_pairs(
     intracellular_threshold_um: float = 1.0,
     n_jobs: int = 4,
     intermediate_results_dir: str = "intermediate_interscellar_results",
-    output_mesh_zarr: str = None 
+    output_mesh_zarr: str = None,
+    resume: bool = False,
 ) -> List[Dict[str, Any]]:
     print(f"Computing interscellar volumes for {len(neighbor_pairs_df)} neighbor pairs...")
     print(f"Using {n_jobs} parallel jobs")
     
     import os
+    import shutil
     import zarr
+
     existing_results = _load_intermediate_results(intermediate_results_dir)
-    zarr_exists = output_mesh_zarr and os.path.exists(output_mesh_zarr) and os.path.isdir(output_mesh_zarr)
-    
-    if existing_results:
-        print(f"Found {len(existing_results)} existing intermediate results")
-        if zarr_exists:
-            print(f"Found existing mesh zarr: {output_mesh_zarr}")
-            zarr_group = zarr.open(output_mesh_zarr, mode='r')
-            existing_pairs = zarr_group.attrs.get('num_pairs', 0)
-            print(f"Existing zarr contains {existing_pairs} pairs")
-        
-        user_input = input("Resume from intermediate results? (y/n): ").lower().strip()
-        if user_input == 'y':
-            print("Resuming from intermediate results...")
-            computed_pairs = set()
-            for result in existing_results:
-                cell_a = result.get('cell_a_id')
-                cell_b = result.get('cell_b_id')
-                if cell_a and cell_b:
-                    pair_key = tuple(sorted([cell_a, cell_b]))
-                    computed_pairs.add(pair_key)
-            
-            print(f"Found {len(computed_pairs)} already-computed pairs")
-            
-            def pair_in_computed(row):
-                pair_key = tuple(sorted([row['cell_a_id'], row['cell_b_id']]))
-                return pair_key in computed_pairs
-            
-            remaining_pairs = neighbor_pairs_df[~neighbor_pairs_df.apply(pair_in_computed, axis=1)].copy()
-            
-            if len(remaining_pairs) == 0:
-                print(f"All pairs already computed! Returning existing results.")
-                if zarr_exists:
-                    print(f"Mesh zarr already contains all pairs")
-                return existing_results
-            else:
-                print(f"Continuing with {len(remaining_pairs)} remaining pairs to compute")
-                neighbor_pairs_df = remaining_pairs
-                if zarr_exists:
-                    print(f"Mesh zarr will be updated incrementally with remaining pairs")
-        else:
-            print("Starting fresh computation...")
-            _cleanup_intermediate_results(intermediate_results_dir)
-            if zarr_exists:
-                import shutil
-                shutil.rmtree(output_mesh_zarr)
-                print(f"Deleted existing mesh zarr to restart")
-            existing_results = []
-    
-    if output_mesh_zarr:
-        if not zarr_exists:
-            _write_chunk_to_mesh_zarr([], mask_3d, output_mesh_zarr, voxel_size_um, initialize=True)
-            print(f"Initialized incremental mesh zarr: {output_mesh_zarr}")
+    zarr_dir = output_mesh_zarr and os.path.isdir(output_mesh_zarr)
+
+    if resume and existing_results:
+        print(f"Found {len(existing_results)} existing intermediate results; resuming.")
+        if zarr_dir:
+            try:
+                zg = zarr.open(output_mesh_zarr, mode="r")
+                print(
+                    f"Existing mesh zarr: {output_mesh_zarr} (num_pairs={zg.attrs.get('num_pairs', '?')})"
+                )
+            except Exception as e:
+                print(f"Note: could not open mesh zarr for info: {e}")
+
+        computed_pairs: Set[Tuple[Any, Any]] = set()
+        for result in existing_results:
+            a, b = result.get("cell_a_id"), result.get("cell_b_id")
+            if a is not None and b is not None:
+                computed_pairs.add(tuple(sorted([a, b])))
+
+        def pair_in_computed(row: pd.Series) -> bool:
+            return (
+                tuple(sorted([row["cell_a_id"], row["cell_b_id"]])) in computed_pairs
+            )
+
+        remaining_pairs = neighbor_pairs_df[
+            ~neighbor_pairs_df.apply(pair_in_computed, axis=1)
+        ].copy()
+        if len(remaining_pairs) == 0:
+            print("All pairs already computed from intermediates.")
+            return existing_results
+        print(f"Continuing with {len(remaining_pairs)} remaining pairs")
+        neighbor_pairs_df = remaining_pairs
+
+    mesh_ok = False
+    if zarr_dir:
+        try:
+            mesh_ok = "interscellar_meshes" in zarr.open(output_mesh_zarr, mode="r")
+        except Exception:
+            mesh_ok = False
+    if output_mesh_zarr and not mesh_ok:
+        if os.path.exists(output_mesh_zarr):
+            shutil.rmtree(output_mesh_zarr)
+        _write_chunk_to_mesh_zarr(
+            [], mask_3d, output_mesh_zarr, voxel_size_um, initialize=True
+        )
+        print(f"Initialized incremental mesh zarr: {output_mesh_zarr}")
     
     cell_type_groups = neighbor_pairs_df.groupby(['cell_a_type', 'cell_b_type'])
     print(f"Found {len(cell_type_groups)} unique cell type combinations")
     
     all_results = []
     
-    for (cell_type_a, cell_type_b), group_df in cell_type_groups:
+    for group_idx, ((cell_type_a, cell_type_b), group_df) in enumerate(cell_type_groups):
         print(f"Processing {len(group_df)} pairs of {cell_type_a}-{cell_type_b}")
         
         group_results = _process_cell_type_group(
             mask_3d, group_df, voxel_size_um, global_surface, halo_bboxes,
             max_distance_um, intracellular_threshold_um, n_jobs, intermediate_results_dir,
-            output_mesh_zarr=output_mesh_zarr
+            output_mesh_zarr=output_mesh_zarr,
+            group_idx=group_idx,
         )
         
         all_results.extend(group_results)
@@ -690,7 +737,8 @@ def _process_cell_type_group(
     intracellular_threshold_um: float,
     n_jobs: int,
     intermediate_results_dir: str = "intermediate_interscellar_results",
-    output_mesh_zarr: str = None 
+    output_mesh_zarr: str = None,
+    group_idx: int = 0,
 ) -> List[Dict[str, Any]]:
     from functools import partial
     
@@ -717,12 +765,28 @@ def _process_cell_type_group(
         edt_cache=edt_cache
     )
     
-    if 'pair_id' in group_df.columns:
-        pair_data = [(row['cell_a_id'], row['cell_b_id'], row['cell_a_type'], row['cell_b_type'], row['pair_id']) 
-                     for idx, row in group_df.iterrows()]
+    if "pair_id" in group_df.columns:
+        pair_data = [
+            (
+                row["cell_a_id"],
+                row["cell_b_id"],
+                row["cell_a_type"],
+                row["cell_b_type"],
+                int(row["pair_id"]),
+            )
+            for _, row in group_df.iterrows()
+        ]
     else:
-        pair_data = [(row['cell_a_id'], row['cell_b_id'], row['cell_a_type'], row['cell_b_type'], idx) 
-                     for idx, row in group_df.iterrows()]
+        pair_data = [
+            (
+                row["cell_a_id"],
+                row["cell_b_id"],
+                row["cell_a_type"],
+                row["cell_b_type"],
+                i,
+            )
+            for i, (_, row) in enumerate(group_df.iterrows(), start=1)
+        ]
     
     chunk_size = 25 # Memory-efficient chunking
     total_chunks = (len(pair_data) - 1) // chunk_size + 1
@@ -748,7 +812,13 @@ def _process_cell_type_group(
             print(f"Chunk {chunk_num} completed: {len(chunk_results)} valid results")
             
             if chunk_results:
-                _save_intermediate_results(chunk_results, chunk_num, total_chunks, intermediate_results_dir)
+                _save_intermediate_results(
+                    chunk_results,
+                    chunk_num,
+                    total_chunks,
+                    intermediate_results_dir,
+                    group_idx,
+                )
                 
                 if output_mesh_zarr:
                     pairs_written = _write_chunk_to_mesh_zarr(
@@ -782,7 +852,13 @@ def _process_cell_type_group(
             print(f"Chunk {chunk_num} completed: {len(chunk_results)} valid results")
             
             if chunk_results:
-                _save_intermediate_results(chunk_results, chunk_num, total_chunks, intermediate_results_dir)
+                _save_intermediate_results(
+                    chunk_results,
+                    chunk_num,
+                    total_chunks,
+                    intermediate_results_dir,
+                    group_idx,
+                )
                 
                 if output_mesh_zarr:
                     pairs_written = _write_chunk_to_mesh_zarr(
@@ -797,14 +873,23 @@ def _process_cell_type_group(
     
     return results
 
-def _save_intermediate_results(chunk_results: List[Dict[str, Any]], chunk_num: int, total_chunks: int, intermediate_dir: str = "intermediate_interscellar_results") -> None:
+def _save_intermediate_results(
+    chunk_results: List[Dict[str, Any]],
+    chunk_num: int,
+    total_chunks: int,
+    intermediate_dir: str = "intermediate_interscellar_results",
+    group_idx: int = 0,
+) -> None:
     import pickle
     import os
     from datetime import datetime
     
     os.makedirs(intermediate_dir, exist_ok=True)
     
-    chunk_file = os.path.join(intermediate_dir, f"chunk_{chunk_num:03d}_of_{total_chunks:03d}.pkl")
+    chunk_file = os.path.join(
+        intermediate_dir,
+        f"chunk_{group_idx:04d}_{chunk_num:03d}_of_{total_chunks:03d}.pkl",
+    )
 
     mask_keys_to_strip = [
         'interscellar_mask', 'intercellular_mask', 'intracellular_mask',
@@ -933,7 +1018,8 @@ def _process_single_pair(
     edt_cache: Dict[int, Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     cell_a_id, cell_b_id, cell_type_a, cell_type_b, pair_id = pair_info
-    
+    pair_id = int(pair_id)
+
     try:
         if cell_a_id not in halo_bboxes or cell_b_id not in halo_bboxes:
             return None
@@ -1194,7 +1280,8 @@ def compute_interscellar_volumes_for_neighbor_pairs(
     intracellular_threshold_um: float = 1.0,
     n_jobs: int = 4,
     intermediate_results_dir: str = "intermediate_interscellar_results",
-    output_mesh_zarr: str = None 
+    output_mesh_zarr: str = None,
+    resume: bool = False,
 ) -> List[Dict[str, Any]]:
     print(f"Computing interscellar volumes for {len(neighbor_pairs_df)} neighbor pairs...")
     
@@ -1208,7 +1295,8 @@ def compute_interscellar_volumes_for_neighbor_pairs(
         intracellular_threshold_um=intracellular_threshold_um,
         n_jobs=n_jobs,
         intermediate_results_dir=intermediate_results_dir,
-        output_mesh_zarr=output_mesh_zarr
+        output_mesh_zarr=output_mesh_zarr,
+        resume=resume,
     )
     
     return results
@@ -1228,13 +1316,12 @@ def _write_chunk_to_mesh_zarr(
         zarr_group = zarr.open(zarr_path, mode='w')
 
         zarr_dataset = zarr_group.create_dataset(
-            'interscellar_meshes',
+            "interscellar_meshes",
             shape=mask_3d.shape,
             dtype=np.uint16,
             chunks=(64, 64, 64),
-            compression='gzip',
-            compression_opts=6,
-            fill_value=0
+            fill_value=0,
+            **_zarr_gzip_dataset_kwargs(level=6),
         )
 
         zarr_group.attrs['description'] = 'Global interscellar volume meshes with unique pair IDs'
@@ -1244,8 +1331,31 @@ def _write_chunk_to_mesh_zarr(
         zarr_group.attrs['coordinate_system'] = 'same_as_input_segmentation'
         zarr_group.attrs['alignment_reference'] = 'input_segmentation_mask'
     else:
-        zarr_group = zarr.open(zarr_path, mode='r+')
-        zarr_dataset = zarr_group['interscellar_meshes']
+        zarr_group = zarr.open(zarr_path, mode="r+")
+        if "interscellar_meshes" not in zarr_group:
+            zarr_dataset = zarr_group.create_dataset(
+                "interscellar_meshes",
+                shape=mask_3d.shape,
+                dtype=np.uint16,
+                chunks=(64, 64, 64),
+                fill_value=0,
+                **_zarr_gzip_dataset_kwargs(level=6),
+            )
+            zarr_group.attrs.setdefault(
+                "description",
+                "Global interscellar volume meshes with unique pair IDs",
+            )
+            zarr_group.attrs.setdefault("voxel_size_um", voxel_size_um)
+            zarr_group.attrs.setdefault("shape", mask_3d.shape)
+            zarr_group.attrs.setdefault("dtype", str(np.uint16))
+            zarr_group.attrs.setdefault(
+                "coordinate_system", "same_as_input_segmentation"
+            )
+            zarr_group.attrs.setdefault(
+                "alignment_reference", "input_segmentation_mask"
+            )
+        else:
+            zarr_dataset = zarr_group["interscellar_meshes"]
     
     for result in chunk_results:
         if 'interscellar_mask' in result and 'union_bbox' in result:
@@ -1357,11 +1467,10 @@ def create_global_interscellar_mesh_zarr(
     zarr_group = zarr.open(output_zarr_path, mode='w')
     
     zarr_group.create_dataset(
-        'interscellar_meshes',
+        "interscellar_meshes",
         data=global_mesh,
         chunks=(64, 64, 64),
-        compression='gzip',
-        compression_opts=6
+        **_zarr_gzip_dataset_kwargs(level=6),
     )
     
     zarr_group.attrs['description'] = 'Global interscellar volume meshes with unique pair IDs'
@@ -1408,8 +1517,8 @@ def create_global_cell_only_volumes_zarr(
             original_segmentation = arr[0, 0]
         elif arr.ndim == 3:
             original_segmentation = arr
-    elif '0' in original_zarr:
-        if isinstance(original_zarr['0'], zarr.hierarchy.Group):
+    elif "0" in original_zarr:
+        if isinstance(original_zarr["0"], ZarrGroup):
             if '0' in original_zarr['0']:
                 arr = original_zarr['0']['0']
                 if arr.ndim == 5:
@@ -1482,37 +1591,47 @@ def create_global_cell_only_volumes_zarr(
     output_key = 'labels' if 'labels' in original_zarr else '0'
     
     chunks = None
-    compression = 'gzip'
-    compression_opts = 6
-    
+    comp_kwargs = _zarr_gzip_dataset_kwargs(level=6)
+
     if output_key in original_zarr:
         original_dataset = original_zarr[output_key]
-        if hasattr(original_dataset, 'chunks') and original_dataset.chunks:
+        if hasattr(original_dataset, "chunks") and original_dataset.chunks:
             if original_dataset.ndim == 5:
                 chunks = (1, 1) + original_dataset.chunks[-3:]
             elif original_dataset.ndim == 3:
                 chunks = (1, 1, 64, 64, 64)
-        if hasattr(original_dataset, 'compression') and original_dataset.compression:
-            compression = original_dataset.compression
-        if hasattr(original_dataset, 'compressor') and original_dataset.compressor:
-            compression = original_dataset.compressor.codec_id
-            compression_opts = getattr(original_dataset.compressor, 'level', 6)
+        comp_kwargs = _zarr_gzip_dataset_kwargs(
+            level=6, copy_compressors_from=original_dataset
+        )
     else:
         chunks = (1, 1, 64, 64, 64)
-    
-    output_zarr = zarr.open(output_zarr_path, mode='w')
-    
+
+    if chunks is None:
+        chunks = (1, 1, 64, 64, 64)
+
+    output_zarr = zarr.open(output_zarr_path, mode="w")
+
     cell_only_volumes_5d = cell_only_volumes[None, None, :, :, :]
     print(f"  Creating dataset '{output_key}' with shape {cell_only_volumes_5d.shape}")
-    
+
     try:
-        output_zarr.create_dataset(
-            output_key,
-            data=cell_only_volumes_5d,
-            chunks=chunks,
-            compression=compression,
-            compression_opts=compression_opts if isinstance(compression_opts, int) else None
-        )
+        if int(zarr.__version__.split(".")[0]) >= 3:
+            ds = output_zarr.create_dataset(
+                output_key,
+                shape=cell_only_volumes_5d.shape,
+                dtype=cell_only_volumes_5d.dtype,
+                chunks=chunks,
+                fill_value=0,
+                **comp_kwargs,
+            )
+            ds[:] = cell_only_volumes_5d
+        else:
+            output_zarr.create_dataset(
+                output_key,
+                data=cell_only_volumes_5d,
+                chunks=chunks,
+                **comp_kwargs,
+            )
     except Exception as e:
         output_zarr = None
         raise RuntimeError(f"Failed to create zarr dataset '{output_key}': {e}") from e
@@ -1566,10 +1685,18 @@ def create_global_cell_only_volumes_zarr(
 
 ## Graph database
 
-def create_interscellar_volume_database(db_path: str = 'interscellar_volumes.db') -> sqlite3.Connection:
+def create_interscellar_volume_database(
+    db_path: str = "interscellar_volumes.db", *, reset: bool = True
+) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
-    
+    if not reset:
+        cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='interscellar_volumes'"
+        )
+        if cursor.fetchone():
+            return conn
+
     cursor.execute("DROP TABLE IF EXISTS interscellar_volumes")
     cursor.execute("DROP TABLE IF EXISTS cells")
     
@@ -1587,7 +1714,7 @@ def create_interscellar_volume_database(db_path: str = 'interscellar_volumes.db'
     # Interscellar Volume table
     cursor.execute("""
     CREATE TABLE interscellar_volumes (
-        pair_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        pair_id INTEGER PRIMARY KEY,
         cell_a_id INTEGER,
         cell_b_id INTEGER,
         cell_a_type TEXT,
@@ -1658,158 +1785,178 @@ def export_interscellar_volumes_to_duckdb(conn: sqlite3.Connection, output_file:
     except ImportError:
         print("Error: DuckDB not available. Install with: pip install duckdb")
         return
-    
-    print(f"Exporting interscellar volumes to DuckDB: {output_file}")
-    
+
+    duckdb_conn = None
     try:
-        df_cells = pd.read_sql_query("SELECT * FROM cells", conn)
-        print(f"  - {len(df_cells)} cells (nodes)")
-    except Exception as e:
-        print(f"Warning: Could not load cells table: {e}")
-        df_cells = pd.DataFrame()
-    
-    df_volumes = pd.read_sql_query("SELECT * FROM interscellar_volumes", conn)
-    print(f"  - {len(df_volumes)} volume pairs")
-    
-    if df_volumes.empty:
-        print("Warning: No volume data to export")
-        return
-    
-    duckdb_conn = duckdb.connect(output_file)
-    
-    if not df_cells.empty:
+        print(f"Exporting interscellar volumes to DuckDB: {output_file}")
+
+        try:
+            df_cells = pd.read_sql_query("SELECT * FROM cells", conn)
+            print(f"  - {len(df_cells)} cells (nodes)")
+        except Exception as e:
+            print(f"Warning: Could not load cells table: {e}")
+            df_cells = pd.DataFrame()
+
+        df_volumes = pd.read_sql_query("SELECT * FROM interscellar_volumes", conn)
+        print(f"  - {len(df_volumes)} volume pairs")
+
+        if df_volumes.empty:
+            print("Warning: No volume data to export")
+            return
+
+        duckdb_conn = duckdb.connect(output_file)
+        for stmt in (
+            "DROP VIEW IF EXISTS cell_type_volume_statistics",
+            "DROP VIEW IF EXISTS volume_distribution",
+            "DROP VIEW IF EXISTS high_volume_interactions",
+            "DROP TABLE IF EXISTS interscellar_volumes",
+            "DROP TABLE IF EXISTS cells",
+            "DROP TABLE IF EXISTS metadata",
+        ):
+            duckdb_conn.execute(stmt)
+
+        if not df_cells.empty:
+            duckdb_conn.execute("""
+                CREATE TABLE cells (
+                    cell_id INTEGER PRIMARY KEY,
+                    cell_type VARCHAR,
+                    centroid_x DOUBLE,
+                    centroid_y DOUBLE,
+                    centroid_z DOUBLE
+                )
+            """)
+            duckdb_conn.register('df_cells', df_cells)
+            duckdb_conn.execute("INSERT INTO cells SELECT * FROM df_cells")
+
         duckdb_conn.execute("""
-            CREATE TABLE cells (
-                cell_id INTEGER PRIMARY KEY,
-                cell_type VARCHAR,
-                centroid_x DOUBLE,
-                centroid_y DOUBLE,
-                centroid_z DOUBLE
+            CREATE TABLE interscellar_volumes (
+                pair_id INTEGER PRIMARY KEY,
+                cell_a_id INTEGER,
+                cell_b_id INTEGER,
+                cell_a_type VARCHAR,
+                cell_b_type VARCHAR,
+                total_interscellar_volume_um3 DOUBLE,
+                total_interscellar_volume_voxels INTEGER,
+                edt_volume_um3 DOUBLE,
+                edt_volume_voxels INTEGER,
+                intracellular_volume_um3 DOUBLE,
+                intracellular_volume_voxels INTEGER,
+                touching_surface_area_um2 DOUBLE,
+                touching_surface_area_voxels INTEGER,
+                mean_distance_um DOUBLE,
+                max_distance_um DOUBLE,
+                num_components INTEGER,
+                largest_component_volume_um3 DOUBLE,
+                voxel_volume_um3 DOUBLE,
+                max_distance_threshold_um DOUBLE,
+                intracellular_threshold_um DOUBLE
             )
         """)
-        duckdb_conn.register('df_cells', df_cells)
-        duckdb_conn.execute("INSERT INTO cells SELECT * FROM df_cells")
-    
-    duckdb_conn.execute("""
-        CREATE TABLE interscellar_volumes (
-            pair_id INTEGER PRIMARY KEY,
-            cell_a_id INTEGER,
-            cell_b_id INTEGER,
-            cell_a_type VARCHAR,
-            cell_b_type VARCHAR,
-            total_interscellar_volume_um3 DOUBLE,
-            total_interscellar_volume_voxels INTEGER,
-            edt_volume_um3 DOUBLE,
-            edt_volume_voxels INTEGER,
-            intracellular_volume_um3 DOUBLE,
-            intracellular_volume_voxels INTEGER,
-            touching_surface_area_um2 DOUBLE,
-            touching_surface_area_voxels INTEGER,
-            mean_distance_um DOUBLE,
-            max_distance_um DOUBLE,
-            num_components INTEGER,
-            largest_component_volume_um3 DOUBLE,
-            voxel_volume_um3 DOUBLE,
-            max_distance_threshold_um DOUBLE,
-            intracellular_threshold_um DOUBLE
-        )
-    """)
-    
-    duckdb_conn.register('df_volumes', df_volumes)
-    duckdb_conn.execute("INSERT INTO interscellar_volumes SELECT * FROM df_volumes")
-    
-    print("Creating analytical views for volume analysis...")
-    
-    duckdb_conn.execute("""
-        CREATE VIEW cell_type_volume_statistics AS
-        SELECT 
-            cell_a_type,
-            cell_b_type,
-            COUNT(*) as pair_count,
-            AVG(total_interscellar_volume_um3) as mean_volume,
-            MIN(total_interscellar_volume_um3) as min_volume,
-            MAX(total_interscellar_volume_um3) as max_volume,
-            SUM(total_interscellar_volume_um3) as total_volume,
-            AVG(mean_distance_um) as mean_distance,
-            AVG(num_components) as mean_components
-        FROM interscellar_volumes
-        GROUP BY cell_a_type, cell_b_type
-        ORDER BY pair_count DESC
-    """)
-    
-    duckdb_conn.execute("""
-        CREATE VIEW volume_distribution AS
-        SELECT 
-            pair_id,
-            cell_a_id,
-            cell_b_id,
-            cell_a_type,
-            cell_b_type,
-            total_interscellar_volume_um3,
-            edt_volume_um3,
-            intracellular_volume_um3,
-            touching_surface_area_um2,
-            mean_distance_um,
-            max_distance_um,
-            num_components,
-            (edt_volume_um3 / NULLIF(total_interscellar_volume_um3, 0)) * 100 as edt_percentage,
-            (intracellular_volume_um3 / NULLIF(total_interscellar_volume_um3, 0)) * 100 as intracellular_percentage,
-            (touching_surface_area_um2 / NULLIF(total_interscellar_volume_um3, 0)) * 100 as surface_percentage
-        FROM interscellar_volumes
-    """)
-    
-    duckdb_conn.execute("""
-        CREATE VIEW high_volume_interactions AS
-        SELECT 
-            pair_id,
-            cell_a_id,
-            cell_b_id,
-            cell_a_type,
-            cell_b_type,
-            total_interscellar_volume_um3,
-            mean_distance_um,
-            num_components
-        FROM interscellar_volumes
-        WHERE total_interscellar_volume_um3 > (
-            SELECT AVG(total_interscellar_volume_um3) + 2 * STDDEV(total_interscellar_volume_um3)
+
+        duckdb_conn.register('df_volumes', df_volumes)
+        duckdb_conn.execute("INSERT INTO interscellar_volumes SELECT * FROM df_volumes")
+
+        print("Creating analytical views for volume analysis...")
+
+        duckdb_conn.execute("""
+            CREATE VIEW cell_type_volume_statistics AS
+            SELECT 
+                cell_a_type,
+                cell_b_type,
+                COUNT(*) as pair_count,
+                AVG(total_interscellar_volume_um3) as mean_volume,
+                MIN(total_interscellar_volume_um3) as min_volume,
+                MAX(total_interscellar_volume_um3) as max_volume,
+                SUM(total_interscellar_volume_um3) as total_volume,
+                AVG(mean_distance_um) as mean_distance,
+                AVG(num_components) as mean_components
             FROM interscellar_volumes
+            GROUP BY cell_a_type, cell_b_type
+            ORDER BY pair_count DESC
+        """)
+
+        duckdb_conn.execute("""
+            CREATE VIEW volume_distribution AS
+            SELECT 
+                pair_id,
+                cell_a_id,
+                cell_b_id,
+                cell_a_type,
+                cell_b_type,
+                total_interscellar_volume_um3,
+                edt_volume_um3,
+                intracellular_volume_um3,
+                touching_surface_area_um2,
+                mean_distance_um,
+                max_distance_um,
+                num_components,
+                (edt_volume_um3 / NULLIF(total_interscellar_volume_um3, 0)) * 100 as edt_percentage,
+                (intracellular_volume_um3 / NULLIF(total_interscellar_volume_um3, 0)) * 100 as intracellular_percentage,
+                (touching_surface_area_um2 / NULLIF(total_interscellar_volume_um3, 0)) * 100 as surface_percentage
+            FROM interscellar_volumes
+        """)
+
+        duckdb_conn.execute("""
+            CREATE VIEW high_volume_interactions AS
+            SELECT 
+                pair_id,
+                cell_a_id,
+                cell_b_id,
+                cell_a_type,
+                cell_b_type,
+                total_interscellar_volume_um3,
+                mean_distance_um,
+                num_components
+            FROM interscellar_volumes
+            WHERE total_interscellar_volume_um3 > (
+                SELECT AVG(total_interscellar_volume_um3) + 2 * STDDEV(total_interscellar_volume_um3)
+                FROM interscellar_volumes
+            )
+            ORDER BY total_interscellar_volume_um3 DESC
+        """)
+
+        duckdb_conn.execute("""
+            CREATE TABLE metadata (
+                key VARCHAR,
+                value VARCHAR
+            )
+        """)
+
+        metadata = [
+            ('total_volume_pairs', str(len(df_volumes))),
+            ('total_cells', str(len(df_cells)) if not df_cells.empty else '0'),
+            ('unique_cell_types', str(df_volumes['cell_a_type'].nunique() + df_volumes['cell_b_type'].nunique()) if not df_volumes.empty else '0'),
+            ('export_timestamp', pd.Timestamp.now().isoformat()),
+            ('database_type', 'interscellar_volumes'),
+            ('format', 'duckdb')
+        ]
+
+        for key, value in metadata:
+            duckdb_conn.execute("INSERT INTO metadata VALUES (?, ?)", [key, value])
+
+        print(f"DuckDB export completed: {output_file}")
+        print(f"  - {len(df_volumes)} volume pairs")
+        if not df_cells.empty:
+            print(f"  - {len(df_cells)} cells (nodes)")
+        print(f"  - Analytical views created for volume analysis")
+        print(f"  - Metadata table populated")
+
+        print("\nExample DuckDB queries:")
+        print("1. Cell type volume stats: SELECT * FROM cell_type_volume_statistics")
+        print("2. Volume distribution: SELECT * FROM volume_distribution LIMIT 10")
+        print("3. High volume interactions: SELECT * FROM high_volume_interactions LIMIT 10")
+        print("4. Metadata: SELECT * FROM metadata")
+    except Exception as e:
+        print(
+            f"Warning: DuckDB export failed (non-fatal; SQLite/CSV/pickle outputs are unchanged): {e}"
         )
-        ORDER BY total_interscellar_volume_um3 DESC
-    """)
-    
-    duckdb_conn.execute("""
-        CREATE TABLE metadata (
-            key VARCHAR,
-            value VARCHAR
-        )
-    """)
-    
-    metadata = [
-        ('total_volume_pairs', str(len(df_volumes))),
-        ('total_cells', str(len(df_cells)) if not df_cells.empty else '0'),
-        ('unique_cell_types', str(df_volumes['cell_a_type'].nunique() + df_volumes['cell_b_type'].nunique()) if not df_volumes.empty else '0'),
-        ('export_timestamp', pd.Timestamp.now().isoformat()),
-        ('database_type', 'interscellar_volumes'),
-        ('format', 'duckdb')
-    ]
-    
-    for key, value in metadata:
-        duckdb_conn.execute("INSERT INTO metadata VALUES (?, ?)", [key, value])
-    
-    duckdb_conn.close()
-    
-    print(f"DuckDB export completed: {output_file}")
-    print(f"  - {len(df_volumes)} volume pairs")
-    if not df_cells.empty:
-        print(f"  - {len(df_cells)} cells (nodes)")
-    print(f"  - Analytical views created for volume analysis")
-    print(f"  - Metadata table populated")
-    
-    print("\nExample DuckDB queries:")
-    print("1. Cell type volume stats: SELECT * FROM cell_type_volume_statistics")
-    print("2. Volume distribution: SELECT * FROM volume_distribution LIMIT 10")
-    print("3. High volume interactions: SELECT * FROM high_volume_interactions LIMIT 10")
-    print("4. Metadata: SELECT * FROM metadata")
+        traceback.print_exc()
+    finally:
+        if duckdb_conn is not None:
+            try:
+                duckdb_conn.close()
+            except Exception:
+                pass
 
 def get_anndata_from_interscellar_database(conn: sqlite3.Connection):
     if not ANNDATA_AVAILABLE:
@@ -1928,29 +2075,11 @@ def get_anndata_from_interscellar_database(conn: sqlite3.Connection):
     
     adata.uns['interscellar_volume_info'] = volume_info
     
-    volume_records = df_volumes.to_dict('records')
-    serializable_records = []
-    for record in volume_records:
-        serializable_record = {}
-        for key, value in record.items():
-            if hasattr(value, 'item'):  # numpy scalar
-                serializable_record[key] = value.item()
-            elif pd.isna(value): 
-                serializable_record[key] = None
-            elif isinstance(value, (np.integer, np.floating)):
-                serializable_record[key] = float(value) if isinstance(value, np.floating) else int(value)
-            elif isinstance(value, (list, dict, tuple)):
-                serializable_record[key] = str(value)
-            elif not isinstance(value, (str, int, float, bool, type(None))):
-                serializable_record[key] = str(value)
-            else:
-                serializable_record[key] = value
-        serializable_records.append(serializable_record)
-    
-    if len(serializable_records) <= 1000:
-        adata.uns['interscellar_volumes'] = serializable_records
+    n_vol = len(df_volumes)
+    if n_vol <= 1000:
+        adata.uns['interscellar_volumes'] = df_volumes.reset_index(drop=True).copy()
     else:
-        adata.uns['interscellar_volumes_count'] = len(serializable_records)
+        adata.uns['interscellar_volumes_count'] = n_vol
         adata.uns['interscellar_volumes_note'] = 'Full volume records available in database and CSV files'
     
     return adata
@@ -1962,12 +2091,19 @@ def export_interscellar_volumes_to_anndata(
     if not ANNDATA_AVAILABLE:
         print("Warning: AnnData not available. Install with: pip install anndata")
         return None
-    
-    adata = get_anndata_from_interscellar_database(conn)
-    
+
+    try:
+        adata = get_anndata_from_interscellar_database(conn)
+    except Exception as e:
+        print(
+            f"Warning: AnnData export skipped (could not build AnnData object; SQLite/CSV unchanged): {e}"
+        )
+        traceback.print_exc()
+        return None
+
     if adata is None:
         return None
-    
+
     try:
         print(f"Writing AnnData to file: {output_file}")
         adata.write(output_file)
@@ -1982,14 +2118,20 @@ def export_interscellar_volumes_to_anndata(
         
         print(f"AnnData object saved to '{output_file}' ({file_size:,} bytes)")
         print(f"  - {adata.n_obs} cells")
-        print(f"  - {len(adata.uns.get('interscellar_volumes', []))} volume pairs")
+        _iv = adata.uns.get("interscellar_volumes")
+        _n_iv = (
+            len(_iv)
+            if isinstance(_iv, pd.DataFrame)
+            else int(adata.uns.get("interscellar_volumes_count", 0))
+        )
+        print(f"  - {_n_iv} volume pairs in uns (full table or count-only)")
         print(f"  - Weighted adjacency matrix shape: {adata.X.shape}")
         print(f"  - Component volumes stored in layers: edt_volume, intracellular_volume, touching_surface_area")
         return adata
     except Exception as e:
-        import traceback
-        print(f"Error saving AnnData file: {e}")
-        print(f"Other outputs (CSV, DB, Zarr) still available")
+        print(
+            f"Warning: AnnData write failed (non-fatal; SQLite/CSV/Zarr unchanged): {e}"
+        )
         traceback.print_exc()
         return None
 
@@ -2011,6 +2153,27 @@ def build_interscellar_volume_database_from_neighbors(
 ) -> sqlite3.Connection:
     print(f"Building interscellar volume database from pre-computed neighbor pairs")
     print(f"Voxel size: {voxel_size_um} μm")
+
+    import glob
+    import shutil
+
+    has_intermediates = bool(
+        glob.glob(os.path.join(intermediate_results_dir, "chunk_*.pkl"))
+    )
+    if resume is None:
+        resume_effective = has_intermediates
+    else:
+        resume_effective = resume
+
+    if resume_effective and not has_intermediates:
+        resume_effective = False
+
+    if not resume_effective:
+        _cleanup_intermediate_results(intermediate_results_dir)
+        if output_mesh_zarr and os.path.exists(output_mesh_zarr):
+            shutil.rmtree(output_mesh_zarr)
+    elif has_intermediates:
+        print(f"Resuming from intermediates in {intermediate_results_dir}")
     
     if neighbor_db_path and os.path.exists(neighbor_db_path):
         try:
@@ -2030,7 +2193,7 @@ def build_interscellar_volume_database_from_neighbors(
     global_surface = load_global_surface_from_pickle(global_surface_pickle)
     halo_bboxes = load_halo_bboxes_from_pickle(halo_bboxes_pickle)
     
-    conn = create_interscellar_volume_database(db_path)
+    conn = create_interscellar_volume_database(db_path, reset=not resume_effective)
     
     if neighbor_db_path and os.path.exists(neighbor_db_path):
         try:
@@ -2083,7 +2246,8 @@ def build_interscellar_volume_database_from_neighbors(
     volume_results = compute_interscellar_volumes_for_neighbor_pairs(
         mask_3d, neighbor_pairs_df, voxel_size_um, global_surface, halo_bboxes,
         max_distance_um, intracellular_threshold_um, n_jobs, intermediate_results_dir,
-        output_mesh_zarr=output_mesh_zarr
+        output_mesh_zarr=output_mesh_zarr,
+        resume=resume_effective,
     )
     
     if volume_results:
@@ -2091,6 +2255,7 @@ def build_interscellar_volume_database_from_neighbors(
         volume_data = []
         for result in volume_results:
             volume_data.append((
+                int(result["pair_id"]),
                 result['cell_a_id'], 
                 result['cell_b_id'], 
                 result['cell_a_type'], 
@@ -2118,15 +2283,15 @@ def build_interscellar_volume_database_from_neighbors(
         
         try:
             cursor.executemany(
-                """INSERT INTO interscellar_volumes 
-                   (cell_a_id, cell_b_id, cell_a_type, cell_b_type, 
+                """INSERT OR REPLACE INTO interscellar_volumes 
+                   (pair_id, cell_a_id, cell_b_id, cell_a_type, cell_b_type, 
                     total_interscellar_volume_um3, total_interscellar_volume_voxels,
                     edt_volume_um3, edt_volume_voxels, intracellular_volume_um3, intracellular_volume_voxels,
                     touching_surface_area_um2, touching_surface_area_voxels,
                     mean_distance_um, max_distance_um, num_components,
                     largest_component_volume_um3, voxel_volume_um3,
                     max_distance_threshold_um, intracellular_threshold_um) 
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", 
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", 
                 volume_data
             )
             conn.commit()
@@ -2138,15 +2303,15 @@ def build_interscellar_volume_database_from_neighbors(
                 for data in volume_data:
                     try:
                         cursor.execute(
-                            """INSERT INTO interscellar_volumes 
-                               (cell_a_id, cell_b_id, cell_a_type, cell_b_type, 
+                            """INSERT OR REPLACE INTO interscellar_volumes 
+                               (pair_id, cell_a_id, cell_b_id, cell_a_type, cell_b_type, 
                                 total_interscellar_volume_um3, total_interscellar_volume_voxels,
                                 edt_volume_um3, edt_volume_voxels, intracellular_volume_um3, intracellular_volume_voxels,
                                 touching_surface_area_um2, touching_surface_area_voxels,
                                 mean_distance_um, max_distance_um, num_components,
                                 largest_component_volume_um3, voxel_volume_um3,
                                 max_distance_threshold_um, intracellular_threshold_um) 
-                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", 
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", 
                             data
                         )
                         inserted_count += 1

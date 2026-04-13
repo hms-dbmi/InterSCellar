@@ -6,6 +6,10 @@ import numpy as np
 
 try:
     import zarr
+    try:
+        from zarr.hierarchy import Group as ZarrGroup
+    except ImportError:
+        ZarrGroup = zarr.Group
 except ImportError:
     print("Error: zarr not installed. Install with: pip install zarr")
     sys.exit(1)
@@ -82,7 +86,7 @@ def main():
     if 'labels' in cell_only_zarr:
         cell_only_labels = cell_only_zarr['labels']
     elif '0' in cell_only_zarr:
-        if isinstance(cell_only_zarr['0'], zarr.hierarchy.Group):
+        if isinstance(cell_only_zarr['0'], ZarrGroup):
             if '0' in cell_only_zarr['0']:
                 cell_only_labels = cell_only_zarr['0']['0']
             else:
