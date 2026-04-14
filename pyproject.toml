@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "InterSCellar"
-version = "0.1.0"
+version = "0.1.1"
 description = "Surface-based Cell Neighbor Detection and Interscellar Volume Computation for 2D & 3D Spatial Omics"
 readme = "README.md"
 requires-python = ">=3.8"
