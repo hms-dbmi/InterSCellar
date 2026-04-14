@@ -69,8 +69,9 @@ all = [
 ]
 
 [project.scripts]
-visualize-all-3d = "interscellar.visualization.visualize_all_3d:main"
-visualize-pair-3d = "interscellar.visualization.visualize_pair_3d:main"
+feature-extract-3d = "interscellar.utils.feature_extraction_3d:main"
+visualize-all-3d = "interscellar.utils.visualize_all_3d:main"
+visualize-pair-3d = "interscellar.utils.visualize_pair_3d:main"
 
 [project.urls]
 Homepage = "https://github.com/hms-dbmi/InterSCellar"
@@ -79,7 +80,7 @@ Issues = "https://github.com/hms-dbmi/InterSCellar/issues"
 
 [tool.setuptools]
 package-dir = {"interscellar" = "src"}
-packages = ["interscellar", "interscellar.api", "interscellar.core", "interscellar.visualization"]
+packages = ["interscellar", "interscellar.api", "interscellar.core", "interscellar.utils"]
 
 [tool.setuptools.package-data]
 "*" = ["*.py", "*.md", "LICENSE"]

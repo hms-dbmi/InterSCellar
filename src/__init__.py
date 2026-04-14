@@ -7,9 +7,10 @@ from .api import (
     compute_cell_only_volumes_3d
 )
 
-from .visualization import (
+from .utils import (
+    extract_features_3d,
     visualize_all_3d,
-    visualize_pair_3d
+    visualize_pair_3d,
 )
 
 __all__ = [
@@ -17,6 +18,7 @@ __all__ = [
     "find_cell_neighbors_3d",
     "compute_interscellar_volumes_3d",
     "compute_cell_only_volumes_3d",
+    "extract_features_3d",
     "visualize_all_3d",
     "visualize_pair_3d",
 ]

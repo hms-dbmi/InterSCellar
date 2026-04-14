@@ -70,6 +70,17 @@ neighbors_2d, adata, conn = interscellar.find_cell_neighbors_2d(
 
 ### Utilities:
 
+**3D expression features (per-object stats from segmentation + raw zarr)**
+
+```sh
+feature-extract-3d \
+  --segmentation-zarr "results/interscellar_volumes.zarr" \
+  --raw-expression-zarr "data/expression.zarr" \
+  --output-csv "results/features_3d.csv"
+```
+
+The default ID column in the CSV is `pair_id` (InterSCellar mesh labels). Use `--object-id-column` for other label volumes.
+
 **Volume Visualization**
 ```sh
 # Full dataset (Napari)
