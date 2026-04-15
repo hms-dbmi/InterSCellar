@@ -2149,7 +2149,8 @@ def build_interscellar_volume_database_from_neighbors(
     max_distance_um: float = 3.0,
     intracellular_threshold_um: float = 1.0,
     n_jobs: int = 4,
-    intermediate_results_dir: str = "intermediate_interscellar_results"
+    intermediate_results_dir: str = "intermediate_interscellar_results",
+    resume: Optional[bool] = None,
 ) -> sqlite3.Connection:
     print(f"Building interscellar volume database from pre-computed neighbor pairs")
     print(f"Voxel size: {voxel_size_um} μm")
