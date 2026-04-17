@@ -46,6 +46,15 @@ def _zarr_gzip_dataset_kwargs(
     return {"compression": "gzip", "compression_opts": level}
 
 
+def _resolve_interscellar_read_dataset_name(zarr_group: Any) -> Optional[str]:
+    # Prefer OME-style root level dataset name.
+    if "0" in zarr_group:
+        return "0"
+    if "interscellar_meshes" in zarr_group:
+        return "interscellar_meshes"
+    return None
+
+
 try:
     import anndata as ad
     ANNDATA_AVAILABLE = True
@@ -688,7 +697,7 @@ def compute_interscellar_volumes_for_all_pairs(
     mesh_ok = False
     if zarr_dir:
         try:
-            mesh_ok = "interscellar_meshes" in zarr.open(output_mesh_zarr, mode="r")
+            mesh_ok = "0" in zarr.open(output_mesh_zarr, mode="r")
         except Exception:
             mesh_ok = False
     if output_mesh_zarr and not mesh_ok:
@@ -1316,28 +1325,29 @@ def _write_chunk_to_mesh_zarr(
         zarr_group = zarr.open(zarr_path, mode='w')
 
         zarr_dataset = zarr_group.create_dataset(
-            "interscellar_meshes",
-            shape=mask_3d.shape,
+            "0",
+            shape=(1, 1) + mask_3d.shape,
             dtype=np.uint16,
-            chunks=(64, 64, 64),
+            chunks=(1, 1, 64, 64, 64),
             fill_value=0,
             **_zarr_gzip_dataset_kwargs(level=6),
         )
 
         zarr_group.attrs['description'] = 'Global interscellar volume meshes with unique pair IDs'
         zarr_group.attrs['voxel_size_um'] = voxel_size_um
-        zarr_group.attrs['shape'] = mask_3d.shape
+        zarr_group.attrs['shape'] = (1, 1) + mask_3d.shape
         zarr_group.attrs['dtype'] = str(np.uint16)
         zarr_group.attrs['coordinate_system'] = 'same_as_input_segmentation'
         zarr_group.attrs['alignment_reference'] = 'input_segmentation_mask'
+        zarr_group.attrs['axes'] = ['t', 'c', 'z', 'y', 'x']
     else:
         zarr_group = zarr.open(zarr_path, mode="r+")
-        if "interscellar_meshes" not in zarr_group:
+        if "0" not in zarr_group:
             zarr_dataset = zarr_group.create_dataset(
-                "interscellar_meshes",
-                shape=mask_3d.shape,
+                "0",
+                shape=(1, 1) + mask_3d.shape,
                 dtype=np.uint16,
-                chunks=(64, 64, 64),
+                chunks=(1, 1, 64, 64, 64),
                 fill_value=0,
                 **_zarr_gzip_dataset_kwargs(level=6),
             )
@@ -1346,7 +1356,7 @@ def _write_chunk_to_mesh_zarr(
                 "Global interscellar volume meshes with unique pair IDs",
             )
             zarr_group.attrs.setdefault("voxel_size_um", voxel_size_um)
-            zarr_group.attrs.setdefault("shape", mask_3d.shape)
+            zarr_group.attrs.setdefault("shape", (1, 1) + mask_3d.shape)
             zarr_group.attrs.setdefault("dtype", str(np.uint16))
             zarr_group.attrs.setdefault(
                 "coordinate_system", "same_as_input_segmentation"
@@ -1354,8 +1364,9 @@ def _write_chunk_to_mesh_zarr(
             zarr_group.attrs.setdefault(
                 "alignment_reference", "input_segmentation_mask"
             )
+            zarr_group.attrs.setdefault("axes", ['t', 'c', 'z', 'y', 'x'])
         else:
-            zarr_dataset = zarr_group["interscellar_meshes"]
+            zarr_dataset = zarr_group["0"]
     
     for result in chunk_results:
         if 'interscellar_mask' in result and 'union_bbox' in result:
@@ -1388,9 +1399,19 @@ def _write_chunk_to_mesh_zarr(
                     mesh_region_labeled = (mesh_region_bool.astype(np.uint16) * pair_id)
                     
                     if np.any(mesh_region_labeled > 0):
-                        existing_region = np.asarray(zarr_dataset[z_start:z_stop, y_start:y_stop, x_start:x_stop])
+                        if zarr_dataset.ndim == 5:
+                            existing_region = np.asarray(
+                                zarr_dataset[0, 0, z_start:z_stop, y_start:y_stop, x_start:x_stop]
+                            )
+                        else:
+                            existing_region = np.asarray(
+                                zarr_dataset[z_start:z_stop, y_start:y_stop, x_start:x_stop]
+                            )
                         merged_region = np.maximum(existing_region, mesh_region_labeled)
-                        zarr_dataset[z_start:z_stop, y_start:y_stop, x_start:x_stop] = merged_region
+                        if zarr_dataset.ndim == 5:
+                            zarr_dataset[0, 0, z_start:z_stop, y_start:y_stop, x_start:x_stop] = merged_region
+                        else:
+                            zarr_dataset[z_start:z_stop, y_start:y_stop, x_start:x_stop] = merged_region
                         
                         del existing_region, merged_region
                         del mesh_region_labeled, mesh_region_bool
@@ -1467,20 +1488,21 @@ def create_global_interscellar_mesh_zarr(
     zarr_group = zarr.open(output_zarr_path, mode='w')
     
     zarr_group.create_dataset(
-        "interscellar_meshes",
-        data=global_mesh,
-        chunks=(64, 64, 64),
+        "0",
+        data=global_mesh[None, None, :, :, :],
+        chunks=(1, 1, 64, 64, 64),
         **_zarr_gzip_dataset_kwargs(level=6),
     )
     
     zarr_group.attrs['description'] = 'Global interscellar volume meshes with unique pair IDs'
     zarr_group.attrs['voxel_size_um'] = voxel_size_um
-    zarr_group.attrs['shape'] = global_mesh.shape
+    zarr_group.attrs['shape'] = (1, 1) + global_mesh.shape
     zarr_group.attrs['dtype'] = str(global_mesh.dtype)
     zarr_group.attrs['num_pairs'] = pairs_written
     
     zarr_group.attrs['coordinate_system'] = 'same_as_input_segmentation'
     zarr_group.attrs['alignment_reference'] = 'input_segmentation_mask'
+    zarr_group.attrs['axes'] = ['t', 'c', 'z', 'y', 'x']
     
     print(f"Created global interscellar mesh zarr with {global_mesh.shape} shape")
     print(f"Contains {zarr_group.attrs['num_pairs']} interscellar volume pairs")
@@ -1559,17 +1581,21 @@ def create_global_cell_only_volumes_zarr(
         raise FileNotFoundError(f"Interscellar volumes zarr not found: {interscellar_volumes_zarr}")
     
     interscellar_zarr = zarr.open(interscellar_volumes_zarr, mode='r')
-    if 'interscellar_meshes' not in interscellar_zarr:
+    interscellar_key = _resolve_interscellar_read_dataset_name(interscellar_zarr)
+    if interscellar_key is None:
         available_keys = list(interscellar_zarr.keys())
         raise ValueError(
-            f"Could not find 'interscellar_meshes' key in {interscellar_volumes_zarr}. "
+            f"Could not find either '0' or 'interscellar_meshes' key in {interscellar_volumes_zarr}. "
             f"Available keys: {available_keys}"
         )
     
-    interscellar_volumes_z = interscellar_zarr['interscellar_meshes']
+    interscellar_volumes_z = interscellar_zarr[interscellar_key]
     
     print(f"  Interscellar volumes shape: {interscellar_volumes_z.shape}, dtype: {interscellar_volumes_z.dtype}")
-    interscellar_volumes = np.asarray(interscellar_volumes_z)
+    if interscellar_volumes_z.ndim == 5:
+        interscellar_volumes = np.asarray(interscellar_volumes_z[0, 0])
+    else:
+        interscellar_volumes = np.asarray(interscellar_volumes_z)
     
     if interscellar_volumes.size == 0:
         raise ValueError("Interscellar volumes array is empty")
@@ -2351,12 +2377,22 @@ def build_interscellar_volume_database_from_neighbors(
         import zarr
         if os.path.exists(output_mesh_zarr) and os.path.isdir(output_mesh_zarr):
             zarr_group = zarr.open(output_mesh_zarr, mode='r')
+            mesh_key = _resolve_interscellar_read_dataset_name(zarr_group)
+            if mesh_key is None:
+                raise ValueError(
+                    f"Mesh zarr {output_mesh_zarr} does not contain expected dataset keys '0' or 'interscellar_meshes'"
+                )
+            mesh_arr = zarr_group[mesh_key]
             final_pairs = zarr_group.attrs.get('num_pairs', 0)
-            zarr_shape = zarr_group['interscellar_meshes'].shape
+            zarr_shape = mesh_arr.shape
             print(f"Final mesh zarr complete:")
             print(f"Shape: {zarr_shape}")
             print(f"Total pairs: {final_pairs}")
-            print(f"Unique pair IDs range from 1 to {np.asarray(zarr_group['interscellar_meshes']).max()}")
+            if mesh_arr.ndim == 5:
+                max_pair_id = np.asarray(mesh_arr[0, 0]).max()
+            else:
+                max_pair_id = np.asarray(mesh_arr).max()
+            print(f"Unique pair IDs range from 1 to {max_pair_id}")
         else:
             has_masks = any('interscellar_mask' in r for r in volume_results)
             if has_masks:
