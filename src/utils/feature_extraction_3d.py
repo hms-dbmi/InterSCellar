@@ -20,6 +20,7 @@ def _zarr_child_keys(obj: Any) -> Optional[List[str]]:
 
 
 def _find_file(filename: str, script_dir: str) -> str:
+    filename = os.path.expanduser(filename)
     possible_paths = [
         filename,
         os.path.join(script_dir, filename),
@@ -29,6 +30,27 @@ def _find_file(filename: str, script_dir: str) -> str:
         if os.path.exists(path):
             return os.path.abspath(path)
     return filename
+
+
+def _find_zarr_store(path_hint: str, script_dir: str) -> str:
+    resolved = _find_file(path_hint, script_dir)
+    p = Path(resolved)
+
+    if p.exists():
+        if p.is_dir() and (p.name.endswith(".zarr") or (p / "zarr.json").exists() or (p / ".zgroup").exists()):
+            return str(p.resolve())
+
+    cur = p if p.exists() else p.parent
+    while str(cur) not in (".", ""):
+        if cur.name.endswith(".zarr") and cur.exists():
+            return str(cur.resolve())
+        if cur.exists() and cur.is_dir() and ((cur / "zarr.json").exists() or (cur / ".zgroup").exists()):
+            return str(cur.resolve())
+        if cur.parent == cur:
+            break
+        cur = cur.parent
+
+    return resolved
 
 
 def _node_shape_ndim(node: Any) -> Tuple[Tuple[int, ...], int]:
@@ -70,10 +92,6 @@ def _iter_segmentation_candidates(seg: Any) -> List[Tuple[str, Any]]:
         if hasattr(node, "ndim") and node.ndim >= 3:
             out.append((name, node))
 
-    if "interscellar_meshes" in gkeys:
-        add("interscellar_meshes", seg["interscellar_meshes"])
-    if "labels" in gkeys:
-        add("labels", seg["labels"])
     if "0" in gkeys:
         node = seg["0"]
         sub = _zarr_child_keys(node)
@@ -81,6 +99,10 @@ def _iter_segmentation_candidates(seg: Any) -> List[Tuple[str, Any]]:
             add("0/0", node["0"])
         elif hasattr(node, "ndim") and node.ndim >= 3:
             add("0", node)
+    if "labels" in gkeys:
+        add("labels", seg["labels"])
+    if "interscellar_meshes" in gkeys:
+        add("interscellar_meshes", seg["interscellar_meshes"])
 
     seen = {id(n) for _, n in out}
     for key in sorted(gkeys):
@@ -158,7 +180,16 @@ def _pick_label_array_matching_spatial(
         except ValueError:
             continue
         if zyx == expected_zyx:
-            priority = 0 if name == "interscellar_meshes" else 1 if name == "labels" else 2 if name.startswith("0") else 3
+            if name == "0/0":
+                priority = 0
+            elif name == "0":
+                priority = 1
+            elif name == "labels":
+                priority = 2
+            elif name == "interscellar_meshes":
+                priority = 3
+            else:
+                priority = 4
             matching.append((priority, name, node))
 
     if not matching:
@@ -378,7 +409,7 @@ def main() -> None:
         metavar="NAME",
         help=(
             "CSV column name for voxel label IDs. "
-            "Use pair_id for interscellar_meshes (same as graph/zarr pair_id). "
+            "Use pair_id for interscellar volumes labels (same as graph/zarr pair_id). "
             "Use cell_id for cell-only label volumes if you prefer."
         ),
     )
@@ -390,8 +421,8 @@ def main() -> None:
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    seg_path = _find_file(args.segmentation_zarr, script_dir)
-    raw_path = _find_file(args.raw_expression_zarr, script_dir)
+    seg_path = _find_zarr_store(args.segmentation_zarr, script_dir)
+    raw_path = _find_zarr_store(args.raw_expression_zarr, script_dir)
 
     if not os.path.exists(seg_path):
         print(f"Error: segmentation zarr not found: {seg_path}")
