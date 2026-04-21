@@ -20,6 +20,12 @@ def _zarr_child_keys(obj: Any) -> Optional[List[str]]:
 
 
 def _find_file(filename: str, script_dir: str) -> str:
+    filename = filename.strip()
+    if len(filename) >= 2 and (
+        (filename[0] == '"' and filename[-1] == '"')
+        or (filename[0] == "'" and filename[-1] == "'")
+    ):
+        filename = filename[1:-1].strip()
     filename = os.path.expanduser(filename)
     possible_paths = [
         filename,
