@@ -1,6 +1,7 @@
 import argparse
 import os
 import sys
+import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -19,44 +20,64 @@ def _zarr_child_keys(obj: Any) -> Optional[List[str]]:
         return None
 
 
-def _find_file(filename: str, script_dir: str) -> str:
-    filename = filename.strip()
-    if len(filename) >= 2 and (
-        (filename[0] == '"' and filename[-1] == '"')
-        or (filename[0] == "'" and filename[-1] == "'")
-    ):
-        filename = filename[1:-1].strip()
-    filename = os.path.expanduser(filename)
-    possible_paths = [
-        filename,
-        os.path.join(script_dir, filename),
-        os.path.join(os.path.dirname(script_dir), filename),
+def _normalize_cli_path(path_value: str) -> str:
+    path_value = unicodedata.normalize("NFKC", path_value).strip()
+
+    path_value = (
+        path_value.replace("“", '"')
+        .replace("”", '"')
+        .replace("‘", "'")
+        .replace("’", "'")
+    )
+    path_value = path_value.replace('\\"', '"').replace("\\'", "'")
+
+    quote_chars = ('"', "'")
+    while len(path_value) >= 2 and path_value[0] in quote_chars and path_value[-1] in quote_chars:
+        path_value = path_value[1:-1].strip()
+
+    path_value = os.path.expanduser(path_value)
+    return os.path.normpath(path_value)
+
+
+def _candidate_input_paths(path_hint: str, script_dir: str) -> List[Path]:
+    normalized = _normalize_cli_path(path_hint)
+    base = Path(normalized)
+    if base.is_absolute():
+        return [base]
+    return [
+        base,
+        Path(script_dir) / base,
+        Path(script_dir).parent / base,
     ]
-    for path in possible_paths:
-        if os.path.exists(path):
-            return os.path.abspath(path)
-    return filename
+
+
+def _is_zarr_store_dir(path: Path) -> bool:
+    return path.is_dir() and (
+        path.name.endswith(".zarr")
+        or (path / "zarr.json").exists()
+        or (path / ".zgroup").exists()
+    )
 
 
 def _find_zarr_store(path_hint: str, script_dir: str) -> str:
-    resolved = _find_file(path_hint, script_dir)
-    p = Path(resolved)
+    candidates = _candidate_input_paths(path_hint, script_dir)
+    existing = [p for p in candidates if p.exists()]
+    p = existing[0] if existing else candidates[0]
 
-    if p.exists():
-        if p.is_dir() and (p.name.endswith(".zarr") or (p / "zarr.json").exists() or (p / ".zgroup").exists()):
-            return str(p.resolve())
+    if _is_zarr_store_dir(p):
+        return str(p.resolve())
 
     cur = p if p.exists() else p.parent
-    while str(cur) not in (".", ""):
+    while True:
         if cur.name.endswith(".zarr") and cur.exists():
             return str(cur.resolve())
-        if cur.exists() and cur.is_dir() and ((cur / "zarr.json").exists() or (cur / ".zgroup").exists()):
+        if _is_zarr_store_dir(cur):
             return str(cur.resolve())
         if cur.parent == cur:
             break
         cur = cur.parent
 
-    return resolved
+    return str(p.resolve(strict=False))
 
 
 def _node_shape_ndim(node: Any) -> Tuple[Tuple[int, ...], int]:
