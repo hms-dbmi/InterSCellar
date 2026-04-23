@@ -1209,9 +1209,9 @@ def compute_interscellar_volume_for_pair(
         interscellar_combined = interscellar_combined | intracellular_combined
     
     if pair_id is not None and interscellar_combined.any():
-        interscellar_mesh_mask = interscellar_combined.astype(np.uint16) * pair_id
+        interscellar_mesh_mask = interscellar_combined.astype(np.uint32) * pair_id
     else:
-        interscellar_mesh_mask = interscellar_combined.astype(np.uint16)
+        interscellar_mesh_mask = interscellar_combined.astype(np.uint32)
     
     if total_interscellar_voxels > 0:
         if intercellular_mask.any():
@@ -1275,7 +1275,7 @@ def compute_interscellar_volume_for_pair(
             'voxel_volume_um3': voxel_volume_um3,
             'max_distance_threshold_um': max_distance_um,
             'intracellular_threshold_um': intracellular_threshold_um,
-            'interscellar_mesh_mask': np.zeros_like(interscellar_combined, dtype=np.uint16),
+            'interscellar_mesh_mask': np.zeros_like(interscellar_combined, dtype=np.uint32),
             'union_bbox': union_bbox
         }
 
@@ -1327,7 +1327,7 @@ def _write_chunk_to_mesh_zarr(
         zarr_dataset = zarr_group.create_dataset(
             "0",
             shape=(1, 1) + mask_3d.shape,
-            dtype=np.uint16,
+            dtype=np.uint32,
             chunks=(1, 1, 64, 64, 64),
             fill_value=0,
             **_zarr_gzip_dataset_kwargs(level=6),
@@ -1336,7 +1336,7 @@ def _write_chunk_to_mesh_zarr(
         zarr_group.attrs['description'] = 'Global interscellar volume meshes with unique pair IDs'
         zarr_group.attrs['voxel_size_um'] = voxel_size_um
         zarr_group.attrs['shape'] = (1, 1) + mask_3d.shape
-        zarr_group.attrs['dtype'] = str(np.uint16)
+        zarr_group.attrs['dtype'] = str(np.uint32)
         zarr_group.attrs['coordinate_system'] = 'same_as_input_segmentation'
         zarr_group.attrs['alignment_reference'] = 'input_segmentation_mask'
         zarr_group.attrs['axes'] = ['t', 'c', 'z', 'y', 'x']
@@ -1346,7 +1346,7 @@ def _write_chunk_to_mesh_zarr(
             zarr_dataset = zarr_group.create_dataset(
                 "0",
                 shape=(1, 1) + mask_3d.shape,
-                dtype=np.uint16,
+                dtype=np.uint32,
                 chunks=(1, 1, 64, 64, 64),
                 fill_value=0,
                 **_zarr_gzip_dataset_kwargs(level=6),
@@ -1357,7 +1357,7 @@ def _write_chunk_to_mesh_zarr(
             )
             zarr_group.attrs.setdefault("voxel_size_um", voxel_size_um)
             zarr_group.attrs.setdefault("shape", (1, 1) + mask_3d.shape)
-            zarr_group.attrs.setdefault("dtype", str(np.uint16))
+            zarr_group.attrs.setdefault("dtype", str(np.uint32))
             zarr_group.attrs.setdefault(
                 "coordinate_system", "same_as_input_segmentation"
             )
@@ -1396,7 +1396,7 @@ def _write_chunk_to_mesh_zarr(
                     mesh_x_size <= interscellar_mask.shape[2]):
                     
                     mesh_region_bool = interscellar_mask[:mesh_z_size, :mesh_y_size, :mesh_x_size]
-                    mesh_region_labeled = (mesh_region_bool.astype(np.uint16) * pair_id)
+                    mesh_region_labeled = (mesh_region_bool.astype(np.uint32) * pair_id)
                     
                     if np.any(mesh_region_labeled > 0):
                         if zarr_dataset.ndim == 5:
@@ -1442,7 +1442,7 @@ def create_global_interscellar_mesh_zarr(
 ) -> None:
     print(f"Creating global interscellar mesh zarr file: {output_zarr_path}")
     
-    global_mesh = np.zeros_like(mask_3d, dtype=np.uint16)
+    global_mesh = np.zeros_like(mask_3d, dtype=np.uint32)
     
     pairs_written = 0
     for result in volume_results:
@@ -1473,7 +1473,7 @@ def create_global_interscellar_mesh_zarr(
                     mesh_x_size <= interscellar_mask.shape[2]):
                     
                     mesh_region_bool = interscellar_mask[:mesh_z_size, :mesh_y_size, :mesh_x_size]
-                    mesh_region_labeled = (mesh_region_bool.astype(np.uint16) * pair_id)
+                    mesh_region_labeled = (mesh_region_bool.astype(np.uint32) * pair_id)
                     
                     global_mesh[z_start:z_stop, y_start:y_stop, x_start:x_stop] = np.maximum(
                         global_mesh[z_start:z_stop, y_start:y_stop, x_start:x_stop],
@@ -1573,8 +1573,8 @@ def create_global_cell_only_volumes_zarr(
     if original_segmentation.size == 0:
         raise ValueError("Original segmentation array is empty")
     if not np.issubdtype(original_segmentation.dtype, np.integer):
-        print(f"Warning: Original segmentation dtype is {original_segmentation.dtype}, converting to uint16")
-        original_segmentation = original_segmentation.astype(np.uint16)
+        print(f"Warning: Original segmentation dtype is {original_segmentation.dtype}, converting to uint32")
+        original_segmentation = original_segmentation.astype(np.uint32)
     
     print("Loading interscellar volumes...")
     if not os.path.exists(interscellar_volumes_zarr):
@@ -1610,7 +1610,7 @@ def create_global_cell_only_volumes_zarr(
         interscellar_volumes > 0, 
         0,
         original_segmentation 
-    ).astype(np.uint16)
+    ).astype(np.uint32)
     
     print("Creating output zarr file...")
     
