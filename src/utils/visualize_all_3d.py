@@ -33,6 +33,35 @@ def _find_file(filename: str, script_dir: str) -> str:
     
     return filename
 
+
+def _interscellar_3d_view(zroot):
+    if 'interscellar_meshes' in zroot:
+        arr = zroot['interscellar_meshes']
+    elif '0' in zroot:
+        if isinstance(zroot['0'], ZarrGroup) and '0' in zroot['0']:
+            arr = zroot['0']['0']
+        else:
+            arr = zroot['0']
+    else:
+        found = False
+        for key in zroot.keys():
+            node = zroot[key]
+            if hasattr(node, 'ndim') and node.ndim >= 3:
+                arr = node
+                found = True
+                print(f"  Found interscellar data in key '{key}'")
+                break
+        if not found:
+            print("Error: Could not find interscellar volume data in zarr")
+            print(f"Available keys: {list(zroot.keys())}")
+            sys.exit(1)
+
+    if arr.ndim == 5:
+        print(f"Interscellar zarr shape (5D): {arr.shape}")
+        print("Using [0, 0, ...] for 3D visualization")
+        return arr[0, 0]
+    return arr
+
 def main():
     parser = argparse.ArgumentParser(
         description="Visualize full cell-only and interscellar volumes in Napari"
@@ -119,11 +148,7 @@ def main():
     
     interscellar_zarr = zarr.open(interscellar_path, mode='r')
     
-    if 'interscellar_meshes' in interscellar_zarr:
-        interscellar_labels = interscellar_zarr['interscellar_meshes']
-    else:
-        print(f"Error: Could not find 'interscellar_meshes' in interscellar zarr")
-        sys.exit(1)
+    interscellar_labels = _interscellar_3d_view(interscellar_zarr)
     
     print(f"  Interscellar volumes shape: {interscellar_labels.shape}")
     

@@ -2,8 +2,9 @@ import argparse
 import os
 import sys
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -109,6 +110,66 @@ def _slice_label_like_visualize(arr: Any) -> np.ndarray:
     raise ValueError(f"Label array must be 3D/4D/5D. Got shape={sh}")
 
 
+def _raw_node_to_czyx_shape(arr: Any) -> Tuple[int, int, int, int]:
+    sh, nd = _node_shape_ndim(arr)
+    if nd == 5:
+        return (sh[1], sh[2], sh[3], sh[4])
+    if nd == 4:
+        return (sh[0], sh[1], sh[2], sh[3])
+    if nd == 3:
+        return (1, sh[0], sh[1], sh[2])
+    raise ValueError(f"Raw expression array must be 3D/4D/5D. Got shape={sh}")
+
+
+def _read_raw_bbox_czyx(
+    raw_arr: Any,
+    z0: int,
+    z1: int,
+    y0: int,
+    y1: int,
+    x0: int,
+    x1: int,
+) -> np.ndarray:
+    _, nd = _node_shape_ndim(raw_arr)
+    if nd == 5:
+        return np.asarray(raw_arr[0, :, z0:z1, y0:y1, x0:x1])
+    if nd == 4:
+        return np.asarray(raw_arr[:, z0:z1, y0:y1, x0:x1])
+    if nd == 3:
+        return np.asarray(raw_arr[z0:z1, y0:y1, x0:x1])[np.newaxis, ...]
+    raise ValueError(f"Raw expression array must be 3D/4D/5D. Got ndim={nd}")
+
+
+def _read_label_slice_xy(label_arr: Any, z_idx: int) -> np.ndarray:
+    _, nd = _node_shape_ndim(label_arr)
+    if nd == 5:
+        return np.asarray(label_arr[0, 0, z_idx])
+    if nd == 4:
+        return np.asarray(label_arr[0, z_idx])
+    if nd == 3:
+        return np.asarray(label_arr[z_idx])
+    raise ValueError(f"Label array must be 3D/4D/5D. Got ndim={nd}")
+
+
+def _read_label_bbox_zyx(
+    label_arr: Any,
+    z0: int,
+    z1: int,
+    y0: int,
+    y1: int,
+    x0: int,
+    x1: int,
+) -> np.ndarray:
+    _, nd = _node_shape_ndim(label_arr)
+    if nd == 5:
+        return np.asarray(label_arr[0, 0, z0:z1, y0:y1, x0:x1])
+    if nd == 4:
+        return np.asarray(label_arr[0, z0:z1, y0:y1, x0:x1])
+    if nd == 3:
+        return np.asarray(label_arr[z0:z1, y0:y1, x0:x1])
+    raise ValueError(f"Label array must be 3D/4D/5D. Got ndim={nd}")
+
+
 def _iter_segmentation_candidates(seg: Any) -> List[Tuple[str, Any]]:
     out: List[Tuple[str, Any]] = []
     gkeys = _zarr_child_keys(seg)
@@ -138,6 +199,39 @@ def _iter_segmentation_candidates(seg: Any) -> List[Tuple[str, Any]]:
             continue
         if hasattr(node, "ndim") and node.ndim >= 3:
             add(key, node)
+
+    return out
+
+
+def _iter_raw_expression_candidates(raw_root: Any) -> List[Tuple[str, Any]]:
+    keys = _zarr_child_keys(raw_root)
+    if keys is None:
+        if hasattr(raw_root, "ndim") and raw_root.ndim >= 3:
+            return [("<root>", raw_root)]
+        return []
+
+    out: List[Tuple[str, Any]] = []
+    seen: Set[int] = set()
+
+    def add_candidate(name: str, node: Any) -> None:
+        if not (hasattr(node, "ndim") and node.ndim >= 3):
+            return
+        node_id = id(node)
+        if node_id in seen:
+            return
+        seen.add(node_id)
+        out.append((name, node))
+
+    for key in sorted(keys):
+        node = raw_root[key]
+        if hasattr(node, "ndim"):
+            add_candidate(key, node)
+            continue
+        subkeys = _zarr_child_keys(node)
+        if subkeys is None:
+            continue
+        for sk in sorted(subkeys):
+            add_candidate(f"{key}/{sk}", node[sk])
 
     return out
 
@@ -190,9 +284,66 @@ def _load_expression_array(raw_root: Any, preferred_key: Optional[str]) -> np.nd
     raise ValueError(f"Raw expression array must be 3D/4D/5D. Got shape={sh}")
 
 
+def _select_expression_array_node_matching_segmentation(
+    raw_root: Any,
+    preferred_key: Optional[str],
+    segmentation_spatial_shapes: List[Tuple[int, int, int]],
+) -> Tuple[str, Any]:
+    if preferred_key:
+        keys = _zarr_child_keys(raw_root)
+        if keys is None:
+            raise ValueError(
+                "--raw-key is set but the zarr store root is a single array, not a group. "
+                "Omit --raw-key or use a group store."
+            )
+        if preferred_key not in keys:
+            raise KeyError(
+                f"Requested --raw-key '{preferred_key}' not found. "
+                f"Available keys: {keys}"
+            )
+        return preferred_key, raw_root[preferred_key]
+
+    raw_candidates = _iter_raw_expression_candidates(raw_root)
+    if not raw_candidates:
+        raise RuntimeError("Could not find any 3D+ raw expression arrays in the provided zarr store.")
+
+    seg_shapes = set(segmentation_spatial_shapes)
+    matching: List[Tuple[int, str, Any, Tuple[int, int, int]]] = []
+    all_candidates: List[Tuple[str, Tuple[int, ...], Tuple[int, int, int]]] = []
+    for name, node in raw_candidates:
+        try:
+            sh, _ = _node_shape_ndim(node)
+            spatial_zyx = _to_spatial_shape_zyx(node)
+        except ValueError:
+            continue
+
+        all_candidates.append((name, sh, spatial_zyx))
+        if spatial_zyx in seg_shapes:
+            priority = -(spatial_zyx[0] * spatial_zyx[1] * spatial_zyx[2])
+            matching.append((priority, name, node, spatial_zyx))
+
+    if matching:
+        matching.sort(key=lambda x: (x[0], x[1]))
+        chosen_name, chosen_node, chosen_spatial = matching[0][1], matching[0][2], matching[0][3]
+        print(
+            "Using raw expression volume "
+            f"'{chosen_name}' (spatial shape {chosen_spatial}) to match segmentation resolution."
+        )
+        return chosen_name, chosen_node
+
+    lines = [
+        "No raw expression multiscale level matches segmentation spatial shape.",
+        f"  Segmentation spatial candidates (Z, Y, X): {sorted(seg_shapes)}",
+        "  Raw expression candidates:",
+    ]
+    for name, sh, spatial_zyx in all_candidates:
+        lines.append(f"    {name}: ndarray shape {sh} -> spatial {spatial_zyx}")
+    raise ValueError("\n".join(lines))
+
+
 def _pick_label_array_matching_spatial(
     seg: zarr.Group, expected_zyx: Tuple[int, int, int]
-) -> Tuple[str, np.ndarray]:
+) -> Tuple[str, Any]:
     candidates = _iter_segmentation_candidates(seg)
     if not candidates:
         gk = _zarr_child_keys(seg) or []
@@ -235,12 +386,7 @@ def _pick_label_array_matching_spatial(
     matching.sort(key=lambda x: (x[0], x[1]))
     chosen_name, chosen_node = matching[0][1], matching[0][2]
     print(f"Using segmentation volume '{chosen_name}' (spatial shape matches raw expression).")
-    labels_3d = _slice_label_like_visualize(chosen_node)
-    if labels_3d.shape != expected_zyx:
-        raise RuntimeError(
-            f"Internal error: after slicing, label shape {labels_3d.shape} != expected {expected_zyx}"
-        )
-    return chosen_name, labels_3d
+    return chosen_name, chosen_node
 
 
 def _collect_axis_hints(z: zarr.Group) -> Dict[str, Any]:
@@ -261,15 +407,15 @@ def _collect_axis_hints(z: zarr.Group) -> Dict[str, Any]:
 
 
 def assert_spatial_compatible(
-    labels_3d: np.ndarray,
-    raw_czyx: np.ndarray,
+    labels_shape_zyx: Tuple[int, int, int],
+    raw_shape_czyx: Tuple[int, int, int, int],
     seg_path: str,
     raw_path: str,
     seg_zarr: zarr.Group,
     raw_zarr: zarr.Group,
 ) -> None:
-    lshape = labels_3d.shape
-    rspatial = raw_czyx.shape[1:]
+    lshape = labels_shape_zyx
+    rspatial = raw_shape_czyx[1:]
     if lshape != rspatial:
         seg_hints = _collect_axis_hints(seg_zarr)
         raw_hints = _collect_axis_hints(raw_zarr)
@@ -278,7 +424,7 @@ def assert_spatial_compatible(
             f"  Segmentation zarr: {seg_path}",
             f"    Label volume shape (Z, Y, X): {lshape}",
             f"  Raw expression zarr: {raw_path}",
-            f"    Shape (C, Z, Y, X): {raw_czyx.shape}",
+            f"    Shape (C, Z, Y, X): {raw_shape_czyx}",
             f"    Spatial part (Z, Y, X): {rspatial}",
             "  Fix: use the same grid and axis order as the original OME/segmentation pipeline "
             "(same Z,Y,X extent and ordering). Resample or re-export if needed.",
@@ -308,81 +454,116 @@ def _safe_channel_names(n_channels: int, names_csv: Optional[str]) -> List[str]:
     return names
 
 
-def _init_channel_stats(label_ids: np.ndarray, n_channels: int) -> Dict[str, np.ndarray]:
-    n_labels = len(label_ids)
-    return {
-        "sum": np.zeros((n_labels, n_channels), dtype=np.float64),
-        "sum_sq": np.zeros((n_labels, n_channels), dtype=np.float64),
-        "nonzero_count": np.zeros((n_labels, n_channels), dtype=np.int64),
-        "min": np.full((n_labels, n_channels), np.inf, dtype=np.float64),
-        "max": np.full((n_labels, n_channels), -np.inf, dtype=np.float64),
-    }
-
-
-def _compute_features(
-    labels_3d: np.ndarray,
-    raw_czyx: np.ndarray,
-    include_background: bool,
-    object_id_column: str = "pair_id",
-) -> pd.DataFrame:
-    unique_labels, counts = np.unique(np.asarray(labels_3d), return_counts=True)
-    if not include_background:
-        keep = unique_labels > 0
-        unique_labels = unique_labels[keep]
-        counts = counts[keep]
-    if len(unique_labels) == 0:
-        raise ValueError("No labeled objects found (after background filtering).")
-
-    label_to_idx = {int(lbl): i for i, lbl in enumerate(unique_labels)}
-    n_channels = raw_czyx.shape[0]
-    stats = _init_channel_stats(unique_labels, n_channels)
-
-    for z_idx in range(labels_3d.shape[0]):
-        label_slice = np.asarray(labels_3d[z_idx])
+def _scan_label_bounding_boxes(
+    labels_arr: Any, include_background: bool
+) -> Dict[int, Dict[str, int]]:
+    z_size, _, _ = _to_spatial_shape_zyx(labels_arr)
+    boxes: Dict[int, Dict[str, int]] = {}
+    for z_idx in range(z_size):
+        label_slice = _read_label_slice_xy(labels_arr, z_idx)
         present_labels = np.unique(label_slice)
         if not include_background:
             present_labels = present_labels[present_labels > 0]
-        if len(present_labels) == 0:
-            continue
-
         for label_id in present_labels:
-            obj_mask = label_slice == label_id
-            if not np.any(obj_mask):
+            ys, xs = np.where(label_slice == label_id)
+            if ys.size == 0:
                 continue
-            row_idx = label_to_idx[int(label_id)]
-            for c in range(n_channels):
-                values = np.asarray(raw_czyx[c, z_idx])[obj_mask].astype(np.float64)
-                if values.size == 0:
-                    continue
-                stats["sum"][row_idx, c] += values.sum()
-                stats["sum_sq"][row_idx, c] += np.square(values).sum()
-                stats["nonzero_count"][row_idx, c] += np.count_nonzero(values)
-                local_min = float(values.min())
-                local_max = float(values.max())
-                if local_min < stats["min"][row_idx, c]:
-                    stats["min"][row_idx, c] = local_min
-                if local_max > stats["max"][row_idx, c]:
-                    stats["max"][row_idx, c] = local_max
+            lid = int(label_id)
+            y_min = int(ys.min())
+            y_max = int(ys.max()) + 1
+            x_min = int(xs.min())
+            x_max = int(xs.max()) + 1
+            if lid not in boxes:
+                boxes[lid] = {
+                    "z0": z_idx,
+                    "z1": z_idx + 1,
+                    "y0": y_min,
+                    "y1": y_max,
+                    "x0": x_min,
+                    "x1": x_max,
+                    "voxel_count": int(ys.size),
+                }
+                continue
+            box = boxes[lid]
+            box["z0"] = min(box["z0"], z_idx)
+            box["z1"] = max(box["z1"], z_idx + 1)
+            box["y0"] = min(box["y0"], y_min)
+            box["y1"] = max(box["y1"], y_max)
+            box["x0"] = min(box["x0"], x_min)
+            box["x1"] = max(box["x1"], x_max)
+            box["voxel_count"] += int(ys.size)
+    return boxes
 
-    voxel_count = counts.astype(np.float64)
-    mean = stats["sum"] / voxel_count[:, None]
-    variance = np.clip(stats["sum_sq"] / voxel_count[:, None] - np.square(mean), a_min=0.0, a_max=None)
-    std = np.sqrt(variance)
-    frac_nonzero = stats["nonzero_count"] / voxel_count[:, None]
 
-    data = {
-        object_id_column: unique_labels.astype(np.int64),
-        "voxel_count": counts.astype(np.int64),
+def _compute_single_label_stats(
+    label_id: int,
+    box: Dict[str, int],
+    labels_arr: Any,
+    raw_arr: Any,
+    n_channels: int,
+) -> Dict[str, Any]:
+    z0, z1 = box["z0"], box["z1"]
+    y0, y1 = box["y0"], box["y1"]
+    x0, x1 = box["x0"], box["x1"]
+    labels_bbox = _read_label_bbox_zyx(labels_arr, z0, z1, y0, y1, x0, x1)
+    obj_mask = labels_bbox == label_id
+    voxel_count = int(np.count_nonzero(obj_mask))
+    if voxel_count == 0:
+        raise RuntimeError(f"Object {label_id} had empty mask inside its own bounding box.")
+
+    raw_bbox = _read_raw_bbox_czyx(raw_arr, z0, z1, y0, y1, x0, x1)
+    if raw_bbox.shape[1:] != labels_bbox.shape:
+        raise RuntimeError(
+            f"Shape mismatch for object {label_id}: raw bbox spatial {raw_bbox.shape[1:]} "
+            f"!= label bbox {labels_bbox.shape}"
+        )
+
+    row: Dict[str, Any] = {
+        "label_id": int(label_id),
+        "voxel_count": voxel_count,
     }
     for c in range(n_channels):
-        data[f"channel_{c}_sum"] = stats["sum"][:, c]
-        data[f"channel_{c}_mean"] = mean[:, c]
-        data[f"channel_{c}_std"] = std[:, c]
-        data[f"channel_{c}_min"] = stats["min"][:, c]
-        data[f"channel_{c}_max"] = stats["max"][:, c]
-        data[f"channel_{c}_nonzero_fraction"] = frac_nonzero[:, c]
+        values = np.asarray(raw_bbox[c])[obj_mask].astype(np.float64, copy=False)
+        row[f"channel_{c}_sum"] = float(values.sum())
+        row[f"channel_{c}_mean"] = float(values.mean())
+        row[f"channel_{c}_std"] = float(values.std())
+        row[f"channel_{c}_min"] = float(values.min())
+        row[f"channel_{c}_max"] = float(values.max())
+        row[f"channel_{c}_nonzero_fraction"] = float(np.count_nonzero(values) / voxel_count)
+    return row
 
-    return pd.DataFrame(data).sort_values(object_id_column).reset_index(drop=True)
+
+def _compute_features_chunked_parallel(
+    labels_arr: Any,
+    raw_arr: Any,
+    include_background: bool,
+    object_id_column: str = "pair_id",
+    num_workers: int = 1,
+) -> pd.DataFrame:
+    boxes = _scan_label_bounding_boxes(labels_arr, include_background=include_background)
+    if not boxes:
+        raise ValueError("No labeled objects found (after background filtering).")
+
+    n_channels = _raw_node_to_czyx_shape(raw_arr)[0]
+    label_ids = sorted(boxes.keys())
+    results: List[Dict[str, Any]] = []
+
+    print(f"Discovered {len(label_ids)} objects. Computing per-object bbox features...")
+    if num_workers <= 1:
+        for lid in label_ids:
+            results.append(_compute_single_label_stats(lid, boxes[lid], labels_arr, raw_arr, n_channels))
+    else:
+        with ThreadPoolExecutor(max_workers=num_workers) as ex:
+            future_to_label = {
+                ex.submit(_compute_single_label_stats, lid, boxes[lid], labels_arr, raw_arr, n_channels): lid
+                for lid in label_ids
+            }
+            for fut in as_completed(future_to_label):
+                results.append(fut.result())
+
+    df = pd.DataFrame(results)
+    df = df.rename(columns={"label_id": object_id_column})
+    return df.sort_values(object_id_column).reset_index(drop=True)
 
 
 def _apply_channel_name_aliases(df: pd.DataFrame, channel_names: List[str]) -> pd.DataFrame:
@@ -445,6 +626,12 @@ def main() -> None:
         default=None,
         help="Output CSV path. Defaults to <segmentation_stem>_features_3d.csv",
     )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=1,
+        help="Number of parallel workers for per-object bbox feature extraction.",
+    )
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -469,28 +656,47 @@ def main() -> None:
     seg_zarr = zarr.open(seg_path, mode="r")
     raw_zarr = zarr.open(raw_path, mode="r")
 
-    raw_czyx = _load_expression_array(raw_zarr, args.raw_key)
-    expected_zyx = tuple(int(x) for x in raw_czyx.shape[1:])
+    seg_candidates = _iter_segmentation_candidates(seg_zarr)
+    if not seg_candidates:
+        gk = _zarr_child_keys(seg_zarr) or []
+        raise RuntimeError(f"No 3D+ arrays found in segmentation zarr. Keys: {gk}")
+    seg_spatial_shapes: List[Tuple[int, int, int]] = []
+    for _name, node in seg_candidates:
+        try:
+            seg_spatial_shapes.append(_to_spatial_shape_zyx(node))
+        except ValueError:
+            continue
 
-    print(f"Raw expression shape (C, Z, Y, X): {raw_czyx.shape}")
+    raw_key_used, raw_arr = _select_expression_array_node_matching_segmentation(
+        raw_zarr,
+        args.raw_key,
+        seg_spatial_shapes,
+    )
+    raw_shape_czyx = _raw_node_to_czyx_shape(raw_arr)
+    expected_zyx = tuple(int(x) for x in raw_shape_czyx[1:])
+
+    print(f"Raw expression shape (C, Z, Y, X): {raw_shape_czyx}")
+    print(f"Raw expression level used: {raw_key_used}")
     print(f"Expected spatial grid (Z, Y, X): {expected_zyx}")
 
-    _seg_key_name, labels_3d = _pick_label_array_matching_spatial(seg_zarr, expected_zyx)
+    _seg_key_name, labels_arr = _pick_label_array_matching_spatial(seg_zarr, expected_zyx)
+    labels_shape_zyx = _to_spatial_shape_zyx(labels_arr)
 
     assert_spatial_compatible(
-        labels_3d, raw_czyx, seg_path, raw_path, seg_zarr, raw_zarr
+        labels_shape_zyx, raw_shape_czyx, seg_path, raw_path, seg_zarr, raw_zarr
     )
 
-    channel_names = _safe_channel_names(raw_czyx.shape[0], args.channel_names)
-    print(f"Labels shape (Z, Y, X): {labels_3d.shape}")
+    channel_names = _safe_channel_names(raw_shape_czyx[0], args.channel_names)
+    print(f"Labels shape (Z, Y, X): {labels_shape_zyx}")
     print(f"Channels: {channel_names}")
-    print("Computing features...")
+    print(f"Computing features with {max(1, args.num_workers)} worker(s)...")
 
-    features_df = _compute_features(
-        labels_3d=labels_3d,
-        raw_czyx=raw_czyx,
+    features_df = _compute_features_chunked_parallel(
+        labels_arr=labels_arr,
+        raw_arr=raw_arr,
         include_background=args.include_background,
         object_id_column=args.object_id_column,
+        num_workers=max(1, args.num_workers),
     )
     features_df = _apply_channel_name_aliases(features_df, channel_names)
     features_df.to_csv(output_csv, index=False)

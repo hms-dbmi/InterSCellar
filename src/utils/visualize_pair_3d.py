@@ -66,6 +66,31 @@ def _cell_only_3d_view(zroot) -> object:
     return arr
 
 
+def _interscellar_3d_view(zroot) -> object:
+    if "interscellar_meshes" in zroot:
+        arr = zroot["interscellar_meshes"]
+    elif "0" in zroot:
+        if isinstance(zroot["0"], ZarrGroup) and "0" in zroot["0"]:
+            arr = zroot["0"]["0"]
+        else:
+            arr = zroot["0"]
+    else:
+        for key in zroot.keys():
+            node = zroot[key]
+            if hasattr(node, "ndim") and node.ndim >= 3:
+                arr = node
+                print(f"  Using interscellar key '{key}'")
+                break
+        else:
+            raise RuntimeError(
+                f"Could not find labels in interscellar zarr. Keys: {list(zroot.keys())}"
+            )
+
+    if arr.ndim == 5:
+        return arr[0, 0]
+    return arr
+
+
 def _try_pair_from_interscellar_db(conn: sqlite3.Connection, pair_id: int) -> Optional[Tuple[int, int]]:
     cur = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='interscellar_volumes'"
@@ -254,7 +279,7 @@ def main():
     p.add_argument(
         "--interscellar-zarr",
         required=True,
-        help="Path to interscellar volumes zarr (contains 'interscellar_meshes')",
+        help="Path to interscellar volumes zarr (legacy 'interscellar_meshes' or new '0' layout)",
     )
     p.add_argument(
         "--db",
@@ -320,12 +345,12 @@ def main():
     cell_only_zarr = zarr.open(cell_only_zarr_path, mode="r")
     interscellar_zarr = zarr.open(interscellar_zarr_path, mode="r")
 
-    if "interscellar_meshes" not in interscellar_zarr:
-        print(f"Error: 'interscellar_meshes' not found in {interscellar_zarr_path}")
+    try:
+        cell_only_3d = _cell_only_3d_view(cell_only_zarr)
+        interscellar_mesh = _interscellar_3d_view(interscellar_zarr)
+    except RuntimeError as e:
+        print(f"Error: {e}")
         sys.exit(1)
-
-    cell_only_3d = _cell_only_3d_view(cell_only_zarr)
-    interscellar_mesh = interscellar_zarr["interscellar_meshes"]
 
     if cell_only_3d.shape != interscellar_mesh.shape:
         print("Error: cell-only and interscellar volumes have different shapes.")

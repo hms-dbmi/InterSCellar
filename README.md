@@ -97,3 +97,13 @@ visualize-pair-3d \
   --pair-opacity 0.6 \
   --cells-opacity 0.7
 ```
+
+```sh
+# Multiple pairs (Napari)
+visualize-multi-3d \
+  --pair-id 123 \
+  --cell-only-zarr "results/cell_only_volumes.zarr" \
+  --interscellar-zarr "results/interscellar_volumes.zarr" \
+  --pair-opacity 0.6 \
+  --cells-opacity 0.7
+```

@@ -71,6 +71,7 @@ all = [
 feature-extract-3d = "interscellar.utils.feature_extraction_3d:main"
 visualize-all-3d = "interscellar.utils.visualize_all_3d:main"
 visualize-pair-3d = "interscellar.utils.visualize_pair_3d:main"
+visualize-multi-3d = "interscellar.utils.visualize_multi_3d:main"
 
 [project.urls]
 Homepage = "https://github.com/hms-dbmi/InterSCellar"
