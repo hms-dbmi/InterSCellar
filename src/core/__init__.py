@@ -29,6 +29,11 @@ from .find_cell_neighbors_3d import (
     export_to_anndata as export_to_anndata_3d,
     get_graph_statistics as get_graph_statistics_3d,
 )
+from .find_cell_neighbors_centroid_3d import (
+    build_centroid_sphere_neighbor_graph_3d,
+    create_neighbor_edge_table_database_centroid_3d,
+    run_centroid_neighbor_script,
+)
 
 # 3D volume computation functions
 from .compute_interscellar_volumes_3d import (
@@ -68,6 +73,9 @@ __all__ = [
     "export_graph_tables_3d",
     "export_to_anndata_3d",
     "get_graph_statistics_3d",
+    "build_centroid_sphere_neighbor_graph_3d",
+    "create_neighbor_edge_table_database_centroid_3d",
+    "run_centroid_neighbor_script",
     # 3D volume computation
     "build_interscellar_volume_database_from_neighbors",
     "create_global_interscellar_mesh_zarr",

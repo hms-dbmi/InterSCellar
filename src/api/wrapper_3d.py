@@ -18,6 +18,7 @@ from ..core.find_cell_neighbors_3d import(
     save_graph_state_to_pickle,
     load_graph_state_from_pickle
 )
+from ..core.find_cell_neighbors_centroid_3d import create_neighbor_edge_table_database_centroid_3d
 
 from ..core.compute_interscellar_volumes_3d import(
     build_interscellar_volume_database_from_neighbors,
@@ -184,6 +185,114 @@ def find_cell_neighbors_3d(
     else:
         conn.close()
         return neighbor_table_df, adata, None
+
+
+def find_cell_neighbors_centroid_3d(
+    metadata_csv_path: str,
+    radius_um: float,
+    voxel_size_um: tuple = (0.56, 0.28, 0.28),
+    db_path: Optional[str] = None,
+    output_csv: Optional[str] = None,
+    output_cells_csv: Optional[str] = None,
+    output_anndata: Optional[str] = None,
+    cell_id: str = "CellID",
+    cell_type: str = "phenotype",
+    centroid_x: str = "X_centroid",
+    centroid_y: str = "Y_centroid",
+    centroid_z: str = "Z_centroid",
+    return_connection: bool = False,
+) -> Tuple[Optional[pd.DataFrame], Optional[object], Optional[object]]:
+    print("=" * 60)
+    print("InterSCellar: Centroid-Sphere Cell Neighbor Detection - 3D")
+    print("=" * 60)
+    
+    overall_start_time = time.time()
+    print(f"\n1. Loading metadata from: {metadata_csv_path}...")
+    step1_start = time.time()
+    try:
+        metadata_df = pd.read_csv(metadata_csv_path)
+        print(f"Loaded {len(metadata_df)} cells")
+    except Exception as e:
+        raise ValueError(f"Error loading metadata CSV: {e}")
+
+    required_cols = [cell_id, cell_type, centroid_x, centroid_y, centroid_z]
+    missing_cols = [col for col in required_cols if col not in metadata_df.columns]
+    if missing_cols:
+        raise ValueError(f"Missing required columns in metadata: {missing_cols}")
+
+    step1_time = time.time() - step1_start
+    print(f"Step 1 completed in {step1_time:.2f} seconds")
+
+    metadata_dir = os.path.dirname(metadata_csv_path) if os.path.dirname(metadata_csv_path) else "."
+    base_name = os.path.splitext(os.path.basename(metadata_csv_path))[0]
+
+    if db_path is None:
+        db_path = os.path.join(metadata_dir, f"{base_name}_centroid_neighbor_graph_3d.db")
+        print(f"db_path: {db_path}")
+
+    if output_csv is None:
+        output_csv = os.path.join(metadata_dir, f"{base_name}_centroid_neighbors_3d.csv")
+        print(f"output_csv: {output_csv}")
+
+    if output_anndata is None:
+        output_anndata = os.path.join(metadata_dir, f"{base_name}_centroid_neighbors_3d.h5ad")
+        print(f"output_anndata: {output_anndata}")
+
+    if output_cells_csv:
+        print(f"output_cells_csv: {output_cells_csv}")
+
+    print(f"\n2. Building centroid-based neighbor graph...")
+    print(f"Parameters: radius={radius_um}μm")
+    step2_start = time.time()
+    conn = create_neighbor_edge_table_database_centroid_3d(
+        metadata_df=metadata_df,
+        radius_um=radius_um,
+        voxel_size_um=voxel_size_um,
+        db_path=db_path,
+        output_csv=output_csv,
+        output_anndata=output_anndata,
+        output_cells_csv=output_cells_csv,
+        cell_id=cell_id,
+        cell_type=cell_type,
+        centroid_x=centroid_x,
+        centroid_y=centroid_y,
+        centroid_z=centroid_z,
+    )
+    step2_time = time.time() - step2_start
+    print(f"Step 2 completed in {step2_time:.2f} seconds")
+    print("Centroid neighbor graph created successfully")
+
+    print(f"\n3. Retrieving results...")
+    neighbor_table_df = pd.read_sql_query("SELECT * FROM neighbors ORDER BY pair_id", conn)
+    print(f"Neighbor table: {len(neighbor_table_df)} pairs")
+
+    adata = get_anndata_from_database(conn)
+    if adata is not None:
+        print(f"AnnData object created: {adata.shape}")
+    else:
+        print("Warning: AnnData not available (install with: pip install anndata)")
+
+    try:
+        stats = get_graph_statistics(conn)
+        print(f"Graph statistics: {stats['total_cells']} cells, {stats['total_edges']} pairs")
+    except Exception as e:
+        print(f"Warning: Could not retrieve statistics: {e}")
+
+    overall_time = time.time() - overall_start_time
+    print(f"\n4. Pipeline completed successfully!")
+    print(f"Total execution time: {overall_time:.2f} seconds")
+    print(f"Database: {db_path}")
+    if output_csv:
+        print(f"CSV output: {output_csv}")
+    if output_anndata:
+        print(f"AnnData output: {output_anndata}")
+    print("=" * 60)
+
+    if return_connection:
+        return neighbor_table_df, adata, conn
+
+    conn.close()
+    return neighbor_table_df, adata, None
 
 def compute_interscellar_volumes_3d(
     ome_zarr_path: str,

@@ -601,6 +601,8 @@ def export_to_anndata(conn: sqlite3.Connection, output_file: str = 'cell_neighbo
         print("Error: AnnData not available. Install with: pip install anndata")
         return None
     try:
+        from scipy.sparse import coo_matrix, csr_matrix
+
         df_cells = pd.read_sql_query("SELECT * FROM cells", conn)
         df_cells["cell_id"] = df_cells["cell_id"].astype(str)
         df_cells.set_index("cell_id", inplace=True)
@@ -608,19 +610,25 @@ def export_to_anndata(conn: sqlite3.Connection, output_file: str = 'cell_neighbo
         df_neighbors = pd.read_sql_query("SELECT * FROM neighbors ORDER BY pair_id", conn)
 
         n_cells = len(df_cells)
-        adjacency_matrix = np.zeros((n_cells, n_cells), dtype=int)
-
         cell_id_to_idx = {str(cid): idx for idx, cid in enumerate(df_cells.index)}
 
-        for _, row in df_neighbors.iterrows():
-            idx_a = cell_id_to_idx.get(str(row["cell_id_a"]))
-            idx_b = cell_id_to_idx.get(str(row["cell_id_b"]))
-            if idx_a is not None and idx_b is not None:
-                adjacency_matrix[idx_a, idx_b] = 1
-                adjacency_matrix[idx_b, idx_a] = 1  # Undirected graph
-
-        from scipy.sparse import csr_matrix
-        sparse_adjacency = csr_matrix(adjacency_matrix)
+        if len(df_neighbors) == 0:
+            sparse_adjacency = csr_matrix((n_cells, n_cells), dtype=int)
+        else:
+            a = df_neighbors["cell_id_a"].astype(str).map(cell_id_to_idx)
+            b = df_neighbors["cell_id_b"].astype(str).map(cell_id_to_idx)
+            valid = a.notna() & b.notna()
+            idx_a = a[valid].to_numpy(dtype=np.int32)
+            idx_b = b[valid].to_numpy(dtype=np.int32)
+            if len(idx_a) == 0:
+                sparse_adjacency = csr_matrix((n_cells, n_cells), dtype=int)
+            else:
+                rows = np.concatenate([idx_a, idx_b])
+                cols = np.concatenate([idx_b, idx_a])
+                data = np.ones(len(rows), dtype=np.int8)
+                sparse_adjacency = coo_matrix(
+                    (data, (rows, cols)), shape=(n_cells, n_cells)
+                ).tocsr()
 
         adata = ad.AnnData(
             X=sparse_adjacency,
@@ -643,7 +651,7 @@ def export_to_anndata(conn: sqlite3.Connection, output_file: str = 'cell_neighbo
         print(f"AnnData object saved to '{output_file}'")
         print(f"  - {n_cells} cells")
         print(f"  - {len(df_neighbors)} neighbor pairs")
-        print(f"  - Adjacency matrix shape: {adjacency_matrix.shape}")
+        print(f"  - Adjacency matrix shape: {sparse_adjacency.shape}")
         return adata
     except Exception as e:
         print(
@@ -656,44 +664,52 @@ def get_anndata_from_database(conn: sqlite3.Connection) -> Optional[ad.AnnData]:
     if not ANNDATA_AVAILABLE:
         print("Error: AnnData not available. Install with: pip install anndata")
         return None
-    
+
+    from scipy.sparse import coo_matrix, csr_matrix
+
     df_cells = pd.read_sql_query("SELECT * FROM cells", conn)
     df_cells["cell_id"] = df_cells["cell_id"].astype(str)
     df_cells.set_index("cell_id", inplace=True)
-    
+
     df_neighbors = pd.read_sql_query("SELECT * FROM neighbors ORDER BY pair_id", conn)
-    
+
     n_cells = len(df_cells)
-    adjacency_matrix = np.zeros((n_cells, n_cells), dtype=int)
-    
     cell_id_to_idx = {str(cid): idx for idx, cid in enumerate(df_cells.index)}
 
-    for _, row in df_neighbors.iterrows():
-        idx_a = cell_id_to_idx.get(str(row["cell_id_a"]))
-        idx_b = cell_id_to_idx.get(str(row["cell_id_b"]))
-        if idx_a is not None and idx_b is not None:
-            adjacency_matrix[idx_a, idx_b] = 1
-            adjacency_matrix[idx_b, idx_a] = 1  # Undirected graph
-    
-    from scipy.sparse import csr_matrix
-    sparse_adjacency = csr_matrix(adjacency_matrix)
-    
+    if len(df_neighbors) == 0:
+        sparse_adjacency = csr_matrix((n_cells, n_cells), dtype=int)
+    else:
+        a = df_neighbors["cell_id_a"].astype(str).map(cell_id_to_idx)
+        b = df_neighbors["cell_id_b"].astype(str).map(cell_id_to_idx)
+        valid = a.notna() & b.notna()
+        idx_a = a[valid].to_numpy(dtype=np.int32)
+        idx_b = b[valid].to_numpy(dtype=np.int32)
+        if len(idx_a) == 0:
+            sparse_adjacency = csr_matrix((n_cells, n_cells), dtype=int)
+        else:
+            rows = np.concatenate([idx_a, idx_b])
+            cols = np.concatenate([idx_b, idx_a])
+            data = np.ones(len(rows), dtype=np.int8)
+            sparse_adjacency = coo_matrix(
+                (data, (rows, cols)), shape=(n_cells, n_cells)
+            ).tocsr()
+
     adata = ad.AnnData(
         X=sparse_adjacency,
         obs=df_cells,
         var=df_cells.copy(),
         obsp={'spatial_connectivities': sparse_adjacency}
     )
-    
+
     adata.uns['neighbor_graph_info'] = {
         'total_cells': n_cells,
         'total_neighbor_pairs': len(df_neighbors),
         'graph_type': 'undirected',
         'construction_method': 'surface_distance_based'
     }
-    
-    adata.obsp['neighbor_pairs'] = df_neighbors
-    
+
+    adata.uns["neighbor_pairs"] = df_neighbors.reset_index(drop=True).copy()
+
     return adata
 
 def save_edges_to_pickle(all_edges: Set[Tuple[int, int]], filepath: str = "all_edges.pkl") -> None:
