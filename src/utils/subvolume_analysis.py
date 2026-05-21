@@ -1,7 +1,7 @@
 import argparse
-import math
 import os
 import sys
+from sys import version_info as _py_version
 import unicodedata
 import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -175,81 +175,229 @@ def _resolve_group_path(group_root: Any, key_path: str) -> Any:
     return node
 
 
-def _read_label_subvolume_zyx(label_arr: Any, combined_slices: Tuple[slice, ...]) -> np.ndarray:
-    arr = np.asarray(label_arr.get_basic_selection(combined_slices))
-    if arr.ndim == 5:
-        return arr[0, 0, :, :, :]
-    if arr.ndim == 4:
-        return arr[0, :, :, :]
-    if arr.ndim == 3:
-        return arr
-    raise ValueError(f"Label array must be 3D/4D/5D. Got ndim={arr.ndim}")
+def _read_label_slice_xy(label_arr: Any, z_idx: int) -> np.ndarray:
+    _, nd = _node_shape_ndim(label_arr)
+    if nd == 5:
+        return np.asarray(label_arr[0, 0, z_idx])
+    if nd == 4:
+        return np.asarray(label_arr[0, z_idx])
+    if nd == 3:
+        return np.asarray(label_arr[z_idx])
+    raise ValueError(f"Label array must be 3D/4D/5D. Got ndim={nd}")
 
 
-def _read_raw_subvolume_czyx(raw_arr: Any, combined_slices: Tuple[slice, ...]) -> np.ndarray:
-    arr = np.asarray(raw_arr.get_basic_selection(combined_slices))
-    if arr.ndim == 5:
-        return arr[0, :, :, :, :]
-    if arr.ndim == 4:
-        return arr
-    if arr.ndim == 3:
-        return arr[np.newaxis, ...]
-    raise ValueError(f"Raw expression array must be 3D/4D/5D. Got ndim={arr.ndim}")
+def _scan_label_tight_boxes(label_arr: Any) -> Dict[int, Dict[str, int]]:
+    """Tight per-label (Z,Y,X) bounding boxes by scanning one Z slice at a time."""
+    z_size, _, _ = _to_spatial_shape_zyx(label_arr)
+    boxes: Dict[int, Dict[str, int]] = {}
+    for z_idx in range(z_size):
+        label_slice = _read_label_slice_xy(label_arr, z_idx)
+        present_labels = np.unique(label_slice)
+        present_labels = present_labels[present_labels > 0]
+        for label_id in present_labels:
+            ys, xs = np.where(label_slice == label_id)
+            if ys.size == 0:
+                continue
+            lid = int(label_id)
+            y_min = int(ys.min())
+            y_max = int(ys.max()) + 1
+            x_min = int(xs.min())
+            x_max = int(xs.max()) + 1
+            if lid not in boxes:
+                boxes[lid] = {
+                    "z0": z_idx,
+                    "z1": z_idx + 1,
+                    "y0": y_min,
+                    "y1": y_max,
+                    "x0": x_min,
+                    "x1": x_max,
+                }
+                continue
+            box = boxes[lid]
+            box["z0"] = min(box["z0"], z_idx)
+            box["z1"] = max(box["z1"], z_idx + 1)
+            box["y0"] = min(box["y0"], y_min)
+            box["y1"] = max(box["y1"], y_max)
+            box["x0"] = min(box["x0"], x_min)
+            box["x1"] = max(box["x1"], x_max)
+    return boxes
 
 
-def _read_raw_subvolume_scaled(
+def _read_label_plane_bboxed(
+    label_arr: Any, z_idx: int, y0: int, y1: int, x0: int, x1: int
+) -> np.ndarray:
+    return _read_label_slice_xy(label_arr, z_idx)[y0:y1, x0:x1]
+
+
+def _read_raw_plane_czyx(
     raw_arr: Any,
-    combined_start: List[int],
-    combined_end: List[int],
-    channel_count: int,
+    z_idx: int,
+    y0: int,
+    y1: int,
+    x0: int,
+    x1: int,
     downsample_level: int,
-    spatial_coords_in_full_raw_space: bool = False,
+    *,
+    labels_on_full_raw_grid: bool,
+    z_origin: int,
 ) -> np.ndarray:
     """
-    Read a raw subvolume aligned to label chunk bounding boxes.
-
-    If ``spatial_coords_in_full_raw_space`` is False (default), the last three slice
-    indices are on the **effective** (downsampled) grid: full-res zarr indices are
-    ``z * factor : z1 * factor`` with step ``factor``.
-
-    If True, the last three indices are already **full-resolution** raw indices
-    (exclusive ends); the reader uses ``z0:z1:factor`` etc. on the raw array.
+    One analysis-grid Z plane as (C, Y, X), reading only the requested XY window from zarr.
     """
-    raw_end = list(combined_end)
-    if len(raw_end) >= 2:
-        raw_end[1] = channel_count
-
-    if downsample_level <= 0:
-        raw_slices = tuple(slice(st, en) for st, en in zip(combined_start, raw_end))
-        return _read_raw_subvolume_czyx(raw_arr, raw_slices)
-
+    _, nd = _node_shape_ndim(raw_arr)
     factor = 2**downsample_level
-    full_czyx = _raw_node_to_czyx_shape(raw_arr)
-    n = len(combined_start)
-    z0, z1 = combined_start[n - 3], combined_end[n - 3]
-    y0, y1 = combined_start[n - 2], combined_end[n - 2]
-    x0, x1 = combined_start[n - 1], combined_end[n - 1]
-    if spatial_coords_in_full_raw_space:
-        fz0, fz1 = z0, min(z1, full_czyx[1])
-        fy0, fy1 = y0, min(y1, full_czyx[2])
-        fx0, fx1 = x0, min(x1, full_czyx[3])
+    full_shape = _raw_node_to_czyx_shape(raw_arr)
+    if labels_on_full_raw_grid:
+        fz0 = z_origin + z_idx * factor
+        fz1 = min(fz0 + factor, full_shape[1])
+        fy0, fy1 = y0, min(y1, full_shape[2])
+        fx0, fx1 = x0, min(x1, full_shape[3])
+        z_sl = slice(fz0, fz1, factor)
+        y_sl = slice(fy0, fy1, factor)
+        x_sl = slice(fx0, fx1, factor)
     else:
-        fz0, fz1 = z0 * factor, min(z1 * factor, full_czyx[1])
-        fy0, fy1 = y0 * factor, min(y1 * factor, full_czyx[2])
-        fx0, fx1 = x0 * factor, min(x1 * factor, full_czyx[3])
+        fz0 = z_idx * factor
+        fz1 = min((z_idx + 1) * factor, full_shape[1])
+        fy0 = y0 * factor
+        fy1 = min(y1 * factor, full_shape[2])
+        fx0 = x0 * factor
+        fx1 = min(x1 * factor, full_shape[3])
+        z_sl = slice(fz0, fz1, factor)
+        y_sl = slice(fy0, fy1, factor)
+        x_sl = slice(fx0, fx1, factor)
 
-    raw_slices_list: List[slice] = []
-    for i, (st, en) in enumerate(zip(combined_start, raw_end)):
-        if i < n - 3:
-            raw_slices_list.append(slice(st, en))
-        elif i == n - 3:
-            raw_slices_list.append(slice(fz0, fz1, factor))
-        elif i == n - 2:
-            raw_slices_list.append(slice(fy0, fy1, factor))
-        else:
-            raw_slices_list.append(slice(fx0, fx1, factor))
+    if nd == 5:
+        plane = np.asarray(raw_arr[0, :, z_sl, y_sl, x_sl])
+    elif nd == 4:
+        plane = np.asarray(raw_arr[:, z_sl, y_sl, x_sl])
+    elif nd == 3:
+        plane = np.asarray(raw_arr[z_sl, y_sl, x_sl])[np.newaxis, ...]
+    else:
+        raise ValueError(f"Raw expression array must be 3D/4D/5D. Got ndim={nd}")
 
-    return _read_raw_subvolume_czyx(raw_arr, tuple(raw_slices_list))
+    if plane.ndim == 4 and plane.shape[1] == 1:
+        plane = plane[:, 0, :, :]
+    return plane
+
+
+def _gather_masked_intensities_zslab(
+    seg_arr: Any,
+    raw_arr: Any,
+    obj_id: int,
+    box: Dict[str, int],
+    channel_count: int,
+    raw_downsample_level: int,
+    labels_on_full_raw_grid: bool,
+) -> Tuple[int, List[np.ndarray]]:
+    """
+    Collect per-channel 1D masked intensities by visiting one (or factor) Z plane(s) at a time.
+
+    Peak memory is O(bbox XY × factor × C), not the full 3D tight bbox.
+    """
+    z0, z1 = box["z0"], box["z1"]
+    y0, y1 = box["y0"], box["y1"]
+    x0, x1 = box["x0"], box["x1"]
+    factor = 2**raw_downsample_level if raw_downsample_level > 0 else 1
+    parts: List[List[np.ndarray]] = [[] for _ in range(channel_count)]
+    voxel_count = 0
+
+    if raw_downsample_level > 0 and labels_on_full_raw_grid:
+        n_analysis_z = (z1 - z0 + factor - 1) // factor
+        for za in range(n_analysis_z):
+            z_block_start = z0 + za * factor
+            z_block_end = min(z_block_start + factor, z1)
+            planes: List[np.ndarray] = []
+            for z_full in range(z_block_start, z_block_end):
+                lab = _read_label_plane_bboxed(seg_arr, z_full, y0, y1, x0, x1)
+                planes.append(lab == obj_id)
+            sub_mask = np.stack(planes, axis=0)
+            if factor > 1:
+                plane_mask = _block_reduce_mask_any(sub_mask, factor)
+            else:
+                plane_mask = sub_mask[0]
+            if not np.any(plane_mask):
+                continue
+            voxel_count += int(np.count_nonzero(plane_mask))
+            raw_plane = _read_raw_plane_czyx(
+                raw_arr,
+                za,
+                y0,
+                y1,
+                x0,
+                x1,
+                raw_downsample_level,
+                labels_on_full_raw_grid=True,
+                z_origin=z0,
+            )
+            if raw_plane.shape[1:] != plane_mask.shape:
+                raise RuntimeError(
+                    f"Raw plane {raw_plane.shape[1:]} != mask plane {plane_mask.shape} "
+                    f"(object {obj_id}, analysis z={za})."
+                )
+            for ch in range(channel_count):
+                parts[ch].append(
+                    np.asarray(raw_plane[ch][plane_mask], dtype=np.float64)
+                )
+    else:
+        for z_idx in range(z0, z1):
+            lab = _read_label_plane_bboxed(seg_arr, z_idx, y0, y1, x0, x1)
+            plane_mask = lab == obj_id
+            if not np.any(plane_mask):
+                continue
+            voxel_count += int(np.count_nonzero(plane_mask))
+            raw_plane = _read_raw_plane_czyx(
+                raw_arr,
+                z_idx,
+                y0,
+                y1,
+                x0,
+                x1,
+                raw_downsample_level,
+                labels_on_full_raw_grid=False,
+                z_origin=0,
+            )
+            if raw_plane.shape[1:] != plane_mask.shape:
+                raise RuntimeError(
+                    f"Raw plane {raw_plane.shape[1:]} != mask plane {plane_mask.shape} "
+                    f"(object {obj_id}, z={z_idx})."
+                )
+            for ch in range(channel_count):
+                parts[ch].append(
+                    np.asarray(raw_plane[ch][plane_mask], dtype=np.float64)
+                )
+
+    merged = [
+        np.concatenate(ch_parts) if ch_parts else np.empty(0, dtype=np.float64)
+        for ch_parts in parts
+    ]
+    return voxel_count, merged
+
+
+def _chunk_keys_for_spatial_box(
+    box: Dict[str, int],
+    chunk_shape: Tuple[int, ...],
+    label_ndim: int,
+) -> List[str]:
+    """Zarr chunk keys (dot-separated indices) that intersect the spatial bbox."""
+    if label_ndim == 5:
+        starts = [0, 0, box["z0"], box["y0"], box["x0"]]
+        ends = [1, 1, box["z1"], box["y1"], box["x1"]]
+    elif label_ndim == 4:
+        starts = [0, box["z0"], box["y0"], box["x0"]]
+        ends = [1, box["z1"], box["y1"], box["x1"]]
+    elif label_ndim == 3:
+        starts = [box["z0"], box["y0"], box["x0"]]
+        ends = [box["z1"], box["y1"], box["x1"]]
+    else:
+        raise ValueError(f"Unsupported label ndim={label_ndim}")
+
+    ranges: List[range] = []
+    for st, en, cs in zip(starts, ends, chunk_shape):
+        cs = max(1, int(cs))
+        i0 = int(st) // cs
+        i1 = (max(int(en), int(st) + 1) - 1) // cs
+        ranges.append(range(i0, i1 + 1))
+    return [".".join(map(str, coord)) for coord in product(*ranges)]
 
 
 def _block_reduce_mask_any(mask: np.ndarray, factor: int) -> np.ndarray:
@@ -283,60 +431,34 @@ def _init_worker(
     raw_arr = _resolve_group_path(raw_zarr, raw_key_path) if raw_key_path != "<root>" else raw_zarr
     _WORKER_CTX["seg_arr"] = seg_arr
     _WORKER_CTX["raw_arr"] = raw_arr
-    _WORKER_CTX["chunk_shape"] = seg_arr.chunks
     _WORKER_CTX["channel_count"] = channel_count
     _WORKER_CTX["raw_downsample_level"] = int(raw_downsample_level)
     _WORKER_CTX["labels_on_full_raw_grid"] = bool(labels_on_full_raw_grid)
 
 
-def _compute_single_object_stats(task: Tuple[int, List[str]]) -> List[Any]:
-    obj_id, chunk_keys = task
+def _compute_single_object_stats(task: Tuple[int, Dict[str, int], List[str]]) -> List[Any]:
+    obj_id, box, chunk_keys = task
     seg_arr = _WORKER_CTX["seg_arr"]
     raw_arr = _WORKER_CTX["raw_arr"]
-    chunk_shape = _WORKER_CTX["chunk_shape"]
     channel_count = _WORKER_CTX["channel_count"]
     raw_downsample_level = int(_WORKER_CTX.get("raw_downsample_level", 0))
     labels_on_full_raw_grid = bool(_WORKER_CTX.get("labels_on_full_raw_grid", False))
 
-    all_start_coords = []
-    all_end_coords = []
-    for key in chunk_keys:
-        chunk_indices = tuple(map(int, key.split(".")))
-        start_coords = [index * size for index, size in zip(chunk_indices, chunk_shape)]
-        end_coords = [start + size for start, size in zip(start_coords, chunk_shape)]
-        all_start_coords.append(start_coords)
-        all_end_coords.append(end_coords)
-
-    combined_start = [min(coords) for coords in zip(*all_start_coords)]
-    combined_end = [max(coords) for coords in zip(*all_end_coords)]
-    seg_slices = tuple(slice(start, end) for start, end in zip(combined_start, combined_end))
-
-    combined_data = _read_label_subvolume_zyx(seg_arr, seg_slices)
-    mask = np.where(combined_data == obj_id, 1, 0)
-    if raw_downsample_level > 0 and labels_on_full_raw_grid:
-        factor = 2**raw_downsample_level
-        mask = _block_reduce_mask_any(mask.astype(bool), factor).astype(np.int8)
-
-    raw_data = _read_raw_subvolume_scaled(
+    voxel_count, channel_values = _gather_masked_intensities_zslab(
+        seg_arr,
         raw_arr,
-        list(combined_start),
-        list(combined_end),
+        obj_id,
+        box,
         channel_count,
         raw_downsample_level,
-        spatial_coords_in_full_raw_space=labels_on_full_raw_grid,
+        labels_on_full_raw_grid,
     )
+    if voxel_count == 0:
+        raise RuntimeError(f"Object {obj_id} had empty mask inside its tight bounding box.")
 
-    if raw_data.shape[1:] != mask.shape:
-        raise RuntimeError(
-            f"Raw subvolume spatial {raw_data.shape[1:]} != mask spatial {mask.shape} "
-            f"(object {obj_id}). Check segmentation vs raw alignment."
-        )
-
-    out = [int(obj_id), int(np.count_nonzero(mask)), chunk_keys]
-    for channel in range(channel_count):
-        channel_data = raw_data[channel, :, :, :]
-        masked = channel_data * mask
-        stats_out = stats(masked)
+    out = [int(obj_id), voxel_count, chunk_keys]
+    for values in channel_values:
+        stats_out = stats(values)
         out.extend([float(x) for x in list(stats_out)])
     return out
 
@@ -527,29 +649,6 @@ def _resolve_raw_array(raw_zarr: Any, resolution_level: int) -> Tuple[str, Any, 
     raise ValueError("\n".join(lines))
 
 
-def _chunk_indices(arr: Any):
-    """Yield chunk coordinate tuples for every zarr chunk in ``arr``."""
-    chunks = [math.ceil(ds / cs) for ds, cs in zip(arr.shape, arr.chunks)]
-    return product(*(range(nc) for nc in chunks))
-
-
-def _calc_mask_to_brick(data: Any) -> Dict[Any, List[str]]:
-    """Map each label ID to the list of zarr chunk keys (dot-separated indices) that touch it."""
-    mask_to_brick: Dict[Any, List[str]] = {}
-    for chunk_coord in _chunk_indices(data):
-        chunk_key = ".".join(map(str, chunk_coord))
-        chunk = data.get_block_selection(chunk_coord)
-        unique_values = np.unique(chunk)
-        if unique_values.size > 1:
-            for val in unique_values[1:]:
-                if val not in mask_to_brick:
-                    mask_to_brick[val] = [chunk_key]
-                else:
-                    mask_to_brick[val].append(chunk_key)
-
-    return mask_to_brick
-
-
 def sub_volume_analysis(
     segmentation_zarr: str,
     raw_expression_zarr: str,
@@ -626,12 +725,17 @@ def sub_volume_analysis(
         columns.append(str(channel) + "_skew")
         columns.append(str(channel) + "_kurtosis")
 
-    # Getting the bricks for each mask
-    print("Initialising the Statistics Calculation")
-    mask_to_brick = _calc_mask_to_brick(data)
+    print("Scanning tight per-object bounding boxes (one Z slice at a time)...")
+    tight_boxes = _scan_label_tight_boxes(data)
     chunk_shape = data.chunks
+    label_ndim = int(data.ndim)
 
-    pending_tasks = [(int(k), v) for k, v in mask_to_brick.items() if int(k) not in worked_ids]
+    pending_tasks: List[Tuple[int, Dict[str, int], List[str]]] = []
+    for obj_id, box in tight_boxes.items():
+        if int(obj_id) in worked_ids:
+            continue
+        chunk_keys = _chunk_keys_for_spatial_box(box, chunk_shape, label_ndim)
+        pending_tasks.append((int(obj_id), box, chunk_keys))
     total = len(pending_tasks)
     if total == 0:
         print("No new objects to process; output is already up to date.")
@@ -659,10 +763,10 @@ def sub_volume_analysis(
             done += 1
             print("\r", f"{done}/{total}", end="")
     else:
-        with ProcessPoolExecutor(
-            max_workers=workers,
-            initializer=_init_worker,
-            initargs=(
+        pool_kwargs: Dict[str, Any] = {
+            "max_workers": workers,
+            "initializer": _init_worker,
+            "initargs": (
                 segmentation_zarr,
                 raw_expression_zarr,
                 seg_key_path,
@@ -671,8 +775,14 @@ def sub_volume_analysis(
                 raw_strided_level,
                 labels_on_full_raw_grid,
             ),
-        ) as ex:
-            futures = {ex.submit(_compute_single_object_stats, task): task[0] for task in pending_tasks}
+        }
+        if _py_version >= (3, 11):
+            pool_kwargs["max_tasks_per_child"] = 1
+        with ProcessPoolExecutor(**pool_kwargs) as ex:
+            futures = {
+                ex.submit(_compute_single_object_stats, task): task[0]
+                for task in pending_tasks
+            }
             done = 0
             for fut in as_completed(futures):
                 row = fut.result()
@@ -729,8 +839,8 @@ def main() -> None:
     parser.add_argument(
         "--num-workers",
         type=int,
-        default=max(1, os.cpu_count() or 1),
-        help="Number of worker processes for per-object computation.",
+        default=1,
+        help="Number of worker processes for per-object computation (default: 1).",
     )
     args = parser.parse_args()
 
