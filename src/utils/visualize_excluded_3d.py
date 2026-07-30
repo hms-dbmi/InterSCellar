@@ -1,5 +1,3 @@
-"""Visualize included vs excluded cells from exclude_truncated output in Napari."""
-
 from __future__ import annotations
 
 import argparse
@@ -53,7 +51,6 @@ def _load_excluded_ids(path: str) -> Set[int]:
 
 
 def _as_zyx_labels(labels_arr: Any) -> np.ndarray:
-    """Materialize a ZYX label volume from a 3D–5D zarr/numpy array."""
     arr = np.asarray(labels_arr)
     if arr.ndim == 5:
         print(f"Label array shape (5D): {arr.shape}; using [0, 0, ...]")
@@ -140,12 +137,10 @@ EXCLUDED_COLOR = (1.0, 0.55, 0.0, 1.0)
 
 
 def _labels_for_solid_color(labels_zyx: np.ndarray) -> np.ndarray:
-    """Collapse to binary labels so every foreground voxel shares one Napari color."""
     return (labels_zyx > 0).astype(np.uint8)
 
 
 def _solid_label_colormap(rgba: Tuple[float, float, float, float]):
-    """Build a napari DirectLabelColormap for a single solid foreground color."""
     from napari.utils.colormaps import DirectLabelColormap
 
     return DirectLabelColormap(
