@@ -69,12 +69,15 @@ def _scan_tight_z_extents(
 
 def compute_percentile_z_thresholds(
     z_extents: Dict[int, Tuple[int, int]],
-    buffer_voxel: int = 5,
+    buffer_voxel_min: int = 5,
+    buffer_voxel_max: int = 5,
     z0_percentile: float = 1.0,
     z1_percentile: float = 99.0,
 ) -> Dict[str, float]:
-    if buffer_voxel < 0:
-        raise ValueError(f"buffer_voxel must be >= 0, got {buffer_voxel}")
+    if buffer_voxel_min < 0:
+        raise ValueError(f"buffer_voxel_min must be >= 0, got {buffer_voxel_min}")
+    if buffer_voxel_max < 0:
+        raise ValueError(f"buffer_voxel_max must be >= 0, got {buffer_voxel_max}")
     if not z_extents:
         raise ValueError("No cells found; cannot compute percentile thresholds.")
 
@@ -83,14 +86,14 @@ def compute_percentile_z_thresholds(
 
     z0_at_pct = float(np.percentile(z0_vals, z0_percentile))
     z1_at_pct = float(np.percentile(z1_vals, z1_percentile))
-    top_threshold = z0_at_pct + float(buffer_voxel)
-    bottom_threshold = z1_at_pct - float(buffer_voxel)
+    top_threshold = z0_at_pct + float(buffer_voxel_min)
+    bottom_threshold = z1_at_pct - float(buffer_voxel_max)
 
     if bottom_threshold <= top_threshold:
         raise ValueError(
             "Invalid Z thresholds: bottom_threshold "
             f"({bottom_threshold}) <= top_threshold ({top_threshold}). "
-            "Try a smaller --buffer-voxel."
+            "Try smaller --buffer-voxel-min / --buffer-voxel-max."
         )
 
     return {
@@ -103,7 +106,8 @@ def compute_percentile_z_thresholds(
         "z1_percentile": float(z1_percentile),
         "z0_at_percentile": z0_at_pct,
         "z1_at_percentile": z1_at_pct,
-        "buffer_voxel": float(buffer_voxel),
+        "buffer_voxel_min": float(buffer_voxel_min),
+        "buffer_voxel_max": float(buffer_voxel_max),
         "top_threshold": top_threshold,
         "bottom_threshold": bottom_threshold,
     }
@@ -126,6 +130,7 @@ def _write_percentile_summary(meta: Dict[str, Any], path: Path) -> None:
         f"label_key: {meta['label_key']}",
         f"max_z: {meta['max_z']}",
         f"n_cells: {int(meta['n_cells'])}",
+        f"n_excluded: {int(meta['n_excluded'])}",
         f"z0 range: [{meta['z0_min']}, {meta['z0_max']}]",
         f"z1 range: [{meta['z1_min']}, {meta['z1_max']}]",
         (
@@ -136,9 +141,10 @@ def _write_percentile_summary(meta: Dict[str, Any], path: Path) -> None:
             f"z1 {meta['z1_percentile']}th percentile: "
             f"{meta['z1_at_percentile']}"
         ),
-        f"buffer_voxel: {meta['buffer_voxel']}",
-        f"top_threshold (z0_p + buffer): {meta['top_threshold']}",
-        f"bottom_threshold (z1_p - buffer): {meta['bottom_threshold']}",
+        f"buffer_voxel_min: {meta['buffer_voxel_min']}",
+        f"buffer_voxel_max: {meta['buffer_voxel_max']}",
+        f"top_threshold (z0_p + buffer_voxel_min): {meta['top_threshold']}",
+        f"bottom_threshold (z1_p - buffer_voxel_max): {meta['bottom_threshold']}",
     ]
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
@@ -165,7 +171,8 @@ def cells_outside_percentile_z_window(
 
 def find_edge_excluded_cell_ids(
     segmentation_zarr: str,
-    buffer_voxel: int = 5,
+    buffer_voxel_min: int = 5,
+    buffer_voxel_max: int = 5,
     z0_percentile: float = 1.0,
     z1_percentile: float = 99.0,
 ) -> Tuple[List[int], Dict[int, Tuple[int, int]], Dict[str, Any]]:
@@ -185,7 +192,8 @@ def find_edge_excluded_cell_ids(
     z_extents = _scan_tight_z_extents(labels_arr, include_background=False)
     thresholds = compute_percentile_z_thresholds(
         z_extents,
-        buffer_voxel=buffer_voxel,
+        buffer_voxel_min=buffer_voxel_min,
+        buffer_voxel_max=buffer_voxel_max,
         z0_percentile=z0_percentile,
         z1_percentile=z1_percentile,
     )
@@ -211,8 +219,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         description=(
             "Compute per-cell tight Z bboxes and percentiles, then exclude cells "
             "outside a percentile-based window: "
-            "top = 1st percentile of z0 + buffer_voxel, "
-            "bottom = 99th percentile of z1 - buffer_voxel."
+            "top = 1st percentile of z0 + buffer_voxel_min, "
+            "bottom = 99th percentile of z1 - buffer_voxel_max."
         )
     )
     parser.add_argument(
@@ -221,12 +229,21 @@ def main(argv: Optional[List[str]] = None) -> None:
         help="Path to cell segmentation OME-Zarr (directory).",
     )
     parser.add_argument(
-        "--buffer-voxel",
+        "--buffer-voxel-min",
         type=int,
         default=5,
         help=(
-            "Margin in voxels around the z0/z1 percentiles "
-            "(top = p1(z0)+buffer, bottom = p99(z1)-buffer; default: 5)."
+            "Margin added to the z0 percentile for the top (low-Z) threshold "
+            "(top = p1(z0)+buffer_voxel_min; default: 5)."
+        ),
+    )
+    parser.add_argument(
+        "--buffer-voxel-max",
+        type=int,
+        default=5,
+        help=(
+            "Margin subtracted from the z1 percentile for the bottom (high-Z) threshold "
+            "(bottom = p99(z1)-buffer_voxel_max; default: 5)."
         ),
     )
     parser.add_argument(
@@ -270,7 +287,8 @@ def main(argv: Optional[List[str]] = None) -> None:
     try:
         excluded, z_extents, meta = find_edge_excluded_cell_ids(
             args.segmentation_zarr,
-            buffer_voxel=args.buffer_voxel,
+            buffer_voxel_min=args.buffer_voxel_min,
+            buffer_voxel_max=args.buffer_voxel_max,
             z0_percentile=args.z0_percentile,
             z1_percentile=args.z1_percentile,
         )
@@ -310,12 +328,12 @@ def main(argv: Optional[List[str]] = None) -> None:
     print(f"Wrote percentile summary to: {summary_path}")
 
     print(
-        f"Top threshold (z0_p + buffer): {meta['top_threshold']:.4g} "
-        f"(exclude z0 < this)"
+        f"Top threshold (z0_p + buffer_voxel_min={meta['buffer_voxel_min']:.0f}): "
+        f"{meta['top_threshold']:.4g} (exclude z0 < this)"
     )
     print(
-        f"Bottom threshold (z1_p - buffer): {meta['bottom_threshold']:.4g} "
-        f"(exclude z1 > this)"
+        f"Bottom threshold (z1_p - buffer_voxel_max={meta['buffer_voxel_max']:.0f}): "
+        f"{meta['bottom_threshold']:.4g} (exclude z1 > this)"
     )
 
     _write_excluded_cell_ids(excluded, excluded_path)
