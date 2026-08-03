@@ -45,6 +45,10 @@ from .compute_interscellar_volumes_3d import (
     export_interscellar_volumes_to_anndata,
     ANNDATA_AVAILABLE,
 )
+from .exclude_nuclei_from_interscellar import (
+    create_interscellar_nuclei_excluded_volumes_zarr,
+    exclude_nuclei_from_interscellar,
+)
 
 __all__ = [
     # 2D neighbor detection
@@ -84,5 +88,8 @@ __all__ = [
     "get_anndata_from_interscellar_database",
     "export_interscellar_volumes_to_anndata",
     "ANNDATA_AVAILABLE",
+    # Nuclei exclusion (standalone post-processing)
+    "create_interscellar_nuclei_excluded_volumes_zarr",
+    "exclude_nuclei_from_interscellar",
 ]
 
