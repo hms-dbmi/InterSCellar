@@ -10,6 +10,7 @@ from .api import (
 
 from .utils import (
     extract_features_3d,
+    combine_cell_and_interscellar_volumes_3d,
     visualize_all_3d,
     visualize_pair_3d,
 )
@@ -21,6 +22,7 @@ __all__ = [
     "compute_interscellar_volumes_3d",
     "compute_cell_only_volumes_3d",
     "extract_features_3d",
+    "combine_cell_and_interscellar_volumes_3d",
     "visualize_all_3d",
     "visualize_pair_3d",
 ]
