@@ -70,6 +70,8 @@ all = [
 [project.scripts]
 feature-extract-3d = "interscellar.utils.feature_extraction_3d:main"
 combine-volumes-3d = "interscellar.utils.combine_volumes_3d:main"
+interscellar-centroids-3d = "interscellar.utils.interscellar_centroids_3d:main"
+spot-count-3d = "interscellar.utils.spot_count_3d:main"
 exclude-truncated = "interscellar.utils.exclude_truncated:main"
 exclude-nuclei-from-interscellar = "interscellar.core.exclude_nuclei_from_interscellar:main"
 visualize-all-3d = "interscellar.utils.visualize_all_3d:main"

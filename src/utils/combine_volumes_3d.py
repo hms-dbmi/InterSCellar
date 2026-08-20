@@ -152,12 +152,6 @@ def combine_cell_and_interscellar_volumes_3d(
     interscellar_zarr: str,
     output_zarr_path: Optional[str] = None,
 ) -> str:
-    """Merge cell-only and interscellar label volumes into one zarr.
-
-    Cell-only IDs are kept. Interscellar pair IDs are remapped so the first
-    new ID is ``max(cell-only ID) + 1``, packing unique pair IDs in sorted
-    order after the cell-only ID range.
-    """
     script_dir = os.path.dirname(os.path.abspath(__file__))
     cell_only_path = _find_zarr_store(cell_only_zarr, script_dir)
     interscellar_path = _find_zarr_store(interscellar_zarr, script_dir)
