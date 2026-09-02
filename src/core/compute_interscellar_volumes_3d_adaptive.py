@@ -1,60 +1,3 @@
-"""Adaptive 3D InterSCellar volume generator.
-
-This module is self-contained by design: it leaves the behavior of
-``compute_interscellar_volumes_3d`` untouched and builds a parallel, pair-local
-adaptive interaction mask that reuses the same crop conventions, cell-surface
-masks, and intercellular corridor definition used by the package.
-
-Definition
-----------
-For a neighboring pair A-B the interscellar volume is a single union of three
-disjoint parts::
-
-    V(A, B) = T_A  u  G_AB  u  T_B
-
-where ``G_AB`` is the extracellular corridor between the two cells and ``T_A``,
-``T_B`` are the pair-facing intracellular territories.
-
-``G_AB`` (corridor) is the set of background voxels whose summed Euclidean
-distance to the two cell surfaces is within ``max_distance_um``::
-
-    G_AB = { x not in A u B : d_dA(x) + d_dB(x) <= max_distance_um }
-
-``T_A`` (territory) is defined by a continuous normalized interaction depth. The
-seed is the whole interaction zone -- the pair-facing part of A's boundary
-``dA_c`` together with the corridor voxels ``G_AB`` -- competed against the
-remaining boundary ``dA_nc``::
-
-    rho(x) = d_c(x) / (d_c(x) + d_o(x)),    T_A = { x in A : rho(x) <= rho_threshold }
-
-where d_c is the distance to ``dA_c u G_AB`` and d_o the distance to ``dA_nc``,
-with default ``rho_threshold=0.5``.
-
-Seeding the inward field on the corridor as well as the boundary is what makes the
-territory follow the detected extracellular gap. Where the labels abut there is no
-corridor and the boundary carries the seed; where they are separated the corridor
-does.
-
-The default ``rho_threshold=0.5`` is the geometric bisector: a voxel is included
-when it is closer to the interaction zone than to the non-contact cell surface. It
-is not a fixed biological distance. This is intentionally shape-aware and should be
-interpreted as a geometric, not pharmacologic, threshold. Use ``max_inward_um`` to
-impose an absolute penetration cap.
-
-Every pair supplied is computed. The pair-facing boundary region is built from
-inclusive rules only -- adjacency to the partner cell, plus every boundary voxel
-within ``surface_distance_um`` of the pair's own closest approach -- so no threshold
-can leave a pair without an intracellular territory. Surface separation is reported
-for reference, never used to reject a pair.
-
-All distances are Euclidean in physical units, using anisotropic voxel sampling
-throughout, so the same threshold means the same physical distance along z as
-along x and y.
-
-Pair IDs are unchanged, and the final pair-local mask can be returned either as
-a binary mask or as a pair-labeled mask, matching the rest of the project.
-"""
-
 from __future__ import annotations
 
 import math
@@ -76,7 +19,6 @@ def _pair_union_bbox(
     cell_a_id: int,
     cell_b_id: int,
 ) -> Tuple[slice, slice, slice]:
-    """Return the union of the two pair-local halo bounding boxes."""
     if cell_a_id not in halo_bboxes or cell_b_id not in halo_bboxes:
         raise KeyError(f"Missing halo bbox for one of the pair cells: {(cell_a_id, cell_b_id)}")
 
@@ -95,7 +37,6 @@ def _fallback_union_bbox(
     voxel_size_um: Tuple[float, float, float],
     max_distance_um: float,
 ) -> Tuple[slice, slice, slice]:
-    """Minimal bbox around both cells, padded by the max-distance halo on each axis."""
     coords = np.concatenate([np.argwhere(mask_a), np.argwhere(mask_b)], axis=0)
     lower = coords.min(axis=0)
     upper = coords.max(axis=0)
@@ -112,7 +53,6 @@ def _fallback_union_bbox(
 
 
 def _surface(mask: np.ndarray, global_surface_crop: Optional[np.ndarray]) -> np.ndarray:
-    """Boundary voxels of ``mask``, from the global surface when available."""
     if global_surface_crop is not None:
         return mask & global_surface_crop
     return mask & ~binary_erosion(mask, structure=_CONN_26)
@@ -124,26 +64,6 @@ def _one_contact_region(
     dist_to_other_surface: np.ndarray,
     surface_distance_um: float,
 ) -> np.ndarray:
-    """The part of one cell's boundary that faces its partner.
-
-    Union of two inclusive rules, never a gate:
-
-    1. boundary directly adjacent to the partner cell, where the labels abut;
-    2. boundary within ``surface_distance_um`` of the pair's *closest approach*.
-
-    Rule 2 is measured relative to the minimum surface-to-surface distance rather than
-    from zero, so it always selects a real patch of facing boundary no matter how far
-    apart the pair is. That is what guarantees every pair from the neighbor list an
-    intracellular territory: separation can shrink the region but never empty it.
-
-    The corridor is deliberately *not* used here. It reaches up to ``max_distance_um``
-    around the rim of the contact, so admitting every boundary voxel adjacent to it
-    would claim roughly half of a touching cell's boundary. That would leave the
-    competing set ``dA_nc`` reduced to the far cap, ``d_o`` would degenerate into a
-    distance-to-the-far-pole field, and the rho bisector would flatten into a plane at
-    constant depth instead of following the local geometry. The corridor belongs in the
-    territory *seed* (see ``_cell_territory``), which is a separate role.
-    """
     if not surface.any():
         return np.zeros_like(surface, dtype=bool)
 
@@ -160,13 +80,6 @@ def _pair_distance_fields(
     surface_b: np.ndarray,
     voxel_size_um: Tuple[float, float, float],
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Distance in micrometers from every voxel of the crop to each cell's surface.
-
-    Computed once per pair and reused for the corridor, the contact regions and the
-    measured separation. Previously the corridor and the contact step each ran their own
-    pair of transforms, and the corridor additionally ran two eight-iteration binary
-    dilations to bound its work -- all of which this replaces.
-    """
     d_a = distance_transform_edt(~surface_a, sampling=voxel_size_um).astype(np.float32)
     d_b = distance_transform_edt(~surface_b, sampling=voxel_size_um).astype(np.float32)
     return d_a, d_b
@@ -179,13 +92,6 @@ def _corridor_from_fields(
     d_b: np.ndarray,
     max_distance_um: float,
 ) -> np.ndarray:
-    """Extracellular gap: background voxels with d_A + d_B <= max_distance_um.
-
-    The criterion is applied directly to the summed distance field. The old
-    dilation-derived candidate region was a city-block ball, which clipped voxels that
-    satisfy the Euclidean criterion diagonally; testing the field itself is both cheaper
-    and exactly the definition.
-    """
     return ~(mask_a | mask_b) & ((d_a + d_b) <= max_distance_um)
 
 
@@ -198,7 +104,6 @@ def _contact_regions(
     d_b: np.ndarray,
     surface_distance_um: float,
 ) -> Tuple[np.ndarray, np.ndarray, float]:
-    """Pair-facing boundary region on each cell, plus the measured surface separation."""
     if not surface_a.any() or not surface_b.any():
         empty = np.zeros_like(surface_a, dtype=bool)
         return empty, empty.copy(), float('inf')
@@ -219,16 +124,6 @@ def _cell_territory(
     contact_rim_um: float,
     max_inward_um: Optional[float],
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Adaptive intracellular territory facing the partner cell.
-
-    The inward distance field grows from the whole interaction zone -- the pair-facing
-    boundary region *and* the extracellular corridor voxels between the cells -- not
-    from a membrane patch alone. Where the labels abut there is no corridor and the
-    boundary carries the seed; where they are separated the corridor does, so a pair
-    that never touches still gets a territory.
-
-    Returns ``(territory, rho, d_contact)``. ``rho`` is NaN outside the cell.
-    """
     empty = np.zeros_like(cell_mask, dtype=bool)
     rho = np.full(cell_mask.shape, np.nan, dtype=np.float32)
 
@@ -282,49 +177,7 @@ def compute_interscellar_volume_adaptive(
     pair_id: Optional[int] = None,
     return_debug: bool = False,
 ) -> Dict[str, Any]:
-    """Compute a pairwise adaptive InterSCellar interaction volume.
 
-    Parameters
-    ----------
-    mask_3d:
-        Full 3D label volume with cell IDs and 0 for background.
-    cell_a_id, cell_b_id:
-        Cell IDs for the queried pair.
-    voxel_size_um:
-        Physical voxel spacing in z, y, x order.
-    global_surface:
-        Optional precomputed global surface mask. If not provided, the function
-        derives a 26-connected surface mask from the cell segmentation, matching
-        ``global_surface_26n`` in find_cell_neighbors_3d.
-    halo_bboxes:
-        Optional mapping from cell ID to the halo-expanded bbox used by the
-        package for pair-local processing. If omitted, a conservative box is
-        derived from the cell masks.
-    max_distance_um:
-        Cutoff on d_A + d_B for the extracellular corridor, in micrometers.
-    surface_distance_um:
-        Optional widening of the pair-facing boundary region, in micrometers. Purely
-        additive: boundary voxels within this distance of the partner's surface are
-        included on top of the adjacency rules. It cannot exclude anything, and a pair
-        that meets it nowhere still gets a territory.
-    rho_threshold:
-        Normalized geometric threshold for the adaptive intracellular territory.
-        The default 0.5 is the bisector between the contact surface and the
-        non-contact cell surface.
-    contact_rim_um:
-        Width of a rim around the interaction zone excluded from the non-contact
-        surface, preventing the territory from pinching shut at the contact edge.
-    max_inward_um:
-        Optional absolute cap on inward penetration, as a physical distance from
-        the contact surface. Disabled by default.
-    exclude_other_cells:
-        Remove voxels belonging to third-party cells from the corridor, so a pair
-        volume never claims a neighbor's interior.
-    pair_id:
-        QP pair ID used for labeling convention compatibility.
-    return_debug:
-        If True, also return the component masks and the rho / distance fields.
-    """
     if cell_a_id == cell_b_id:
         raise ValueError("cell_a_id and cell_b_id must be different for a pair computation")
 
@@ -446,12 +299,6 @@ compute_interscellar_volume_adaptive_for_pair = compute_interscellar_volume_adap
 # --------------------------------------------------------------------------- #
 
 def truncated_cell_ids(mask_3d: np.ndarray) -> set:
-    """Cell IDs touching any face of the volume.
-
-    A cell clipped by the crop boundary has a flat, fabricated surface there. That
-    surface is counted as non-contact boundary, which biases rho, and it can seed a
-    spurious corridor. Such cells are usually excluded from a cropped analysis.
-    """
     faces = (
         mask_3d[0], mask_3d[-1],
         mask_3d[:, 0], mask_3d[:, -1],
@@ -475,17 +322,6 @@ def compute_interscellar_volumes_adaptive_for_pairs(
     verbose: bool = True,
     **kwargs: Any,
 ):
-    """Run the adaptive computation over many pairs, skipping ones this volume cannot support.
-
-    ``pairs`` is an iterable of ``(cell_a_id, cell_b_id, pair_id)``. Pairs naming a
-    cell absent from ``mask_3d`` are skipped, which is the normal case when the pair
-    list was built on a full segmentation and the volume here is a crop of it.
-
-    Returns ``(records, skipped)`` where ``records`` is a list of per-pair result dicts
-    and ``skipped`` maps a reason to the pairs dropped. With ``keep_masks=False`` the
-    array fields are dropped from each record, which matters on a whole-volume run where
-    holding one crop per pair would otherwise dominate memory.
-    """
     present = set(np.unique(mask_3d).tolist())
     present.discard(0)
 
@@ -538,13 +374,6 @@ def compute_interscellar_volumes_adaptive_for_pairs(
 
 
 def _open_label_volume_lazy(path: str):
-    """Return a lazily-indexable 3D label volume, or None if it must be read whole.
-
-    Workers only ever touch ``mask_3d[union_bbox]`` -- one pair-local crop at a time --
-    so on a whole-segmentation run there is no reason for each of them to hold a full
-    copy. A zarr array (or a memory-mapped .npy) slices to exactly the requested region,
-    which turns per-worker memory from the size of the volume into the size of a crop.
-    """
     if path.endswith(".npy"):
         array = np.load(path, mmap_mode="r")
         return array if array.ndim == 3 else None
@@ -573,7 +402,6 @@ def _open_label_volume_lazy(path: str):
 
 
 def _load_label_volume(path: str) -> np.ndarray:
-    """Load a 3D label volume from .npy or an OME-Zarr store."""
     if path.endswith(".npy"):
         return np.load(path)
 
@@ -603,12 +431,6 @@ def _load_label_volume(path: str) -> np.ndarray:
 
 
 def _load_pairs(path: str):
-    """Read (cell_a_id, cell_b_id, pair_id) triples from a neighbor CSV or .db.
-
-    Deliberately self-contained -- no import from the rest of the package -- so this
-    file can be run as a plain script without importing ``interscellar`` and its
-    optional dependencies.
-    """
     import pandas as pd
 
     if path.endswith(".db"):
@@ -715,14 +537,6 @@ def compute_halo_bboxes(
     max_distance_um: float,
     cell_ids=None,
 ) -> Dict[int, Tuple[slice, slice, slice]]:
-    """Per-cell bounding boxes padded by the interaction halo, from one pass.
-
-    Essential for whole-volume runs. Without a bbox table, every pair falls back to
-    ``_fallback_union_bbox``, which scans the entire label volume twice to locate its two
-    cells -- O(pairs x volume). One ``find_objects`` pass replaces all of it.
-
-    The padding matches ``_fallback_union_bbox`` so results are identical either way.
-    """
     from scipy.ndimage import find_objects
 
     try:
@@ -763,10 +577,6 @@ CSV_COLUMNS = [
 
 
 def _create_array(store, name, shape, dtype, chunks, fill_value=0):
-    """Create an array in a zarr group across zarr 2 and 3.
-
-    zarr 3 removed ``Group.create_dataset`` in favour of ``Group.create_array``.
-    """
     if hasattr(store, "create_array"):          # zarr 3
         try:
             return store.create_array(name, shape=shape, dtype=dtype, chunks=chunks,
@@ -778,11 +588,6 @@ def _create_array(store, name, shape, dtype, chunks, fill_value=0):
 
 
 def _open_output_zarr(path, shape, appending, voxel_size_um, geometry):
-    """Create (or reopen for resume) the pair-label and overlap-count datasets.
-
-    Both are allocated on disk at full volume shape and written region by region, so a
-    whole-segmentation run never holds them in RAM.
-    """
     import zarr
 
     store = zarr.open(path, mode="a" if appending else "w")
@@ -828,7 +633,6 @@ def _open_output_zarr(path, shape, appending, voxel_size_um, geometry):
 
 
 def _write_pair_into(ds_labels, ds_overlap, record):
-    """Fold one pair's mask into the on-disk label and overlap volumes."""
     bbox = record['union_bbox']
     claim = record['interscellar_mask']
     pair_id = int(record['pair_id'])
@@ -843,7 +647,6 @@ def _write_pair_into(ds_labels, ds_overlap, record):
 
 
 def _report_overlap(ds_labels, ds_overlap, path, slab=16):
-    """Global overlap summary, read back a slab at a time."""
     claimed = shared = 0
     peak = 0
     for z in range(0, ds_overlap.shape[0], slab):
@@ -861,23 +664,6 @@ def _report_overlap(ds_labels, ds_overlap, path, slab=16):
 
 
 def _build_label_volume(records, shape):
-    """Rasterize every pair mask into one label volume, and account for overlaps.
-
-    Pairs that share a cell routinely claim the same voxels -- each pair's territory is
-    computed independently against the full segmentation, so a cell in five pairs
-    contributes territory to all five, and those territories overlap near the shared
-    membrane. Per-pair volumes in the CSV are unaffected by this: each counts all of its
-    own voxels. Only a single-label raster has to pick one winner per voxel.
-
-    Collision policy is ``np.maximum`` -- the highest pair ID wins -- which matches
-    ``compute_interscellar_volumes_3d`` and, unlike first-writer-wins, does not depend on
-    the order results arrive in. That matters because ``--n-jobs`` completes batches out
-    of order.
-
-    ``overlap_count`` records how many pairs claimed each voxel, so what the single label
-    hides stays recoverable. Each record also gains ``shared_voxels`` and
-    ``exclusive_voxels``.
-    """
     labels = np.zeros(shape, dtype=np.uint32)
     overlap_count = np.zeros(shape, dtype=np.uint16)
 
@@ -907,13 +693,6 @@ def _build_label_volume(records, shape):
 
 
 def derive_output_stem(neighbor_pairs_path: str) -> str:
-    """Stem for output names, using the same rule as ``compute_interscellar_volumes_3d``.
-
-    That pipeline builds every output name from the neighbor-pairs file, stripping the
-    neighbour markers off the basename (see ``wrapper_3d.compute_interscellar_volumes_3d``).
-    Mirroring it keeps the two pipelines' outputs sitting side by side and lets
-    ``visualize_pair_3d`` resolve a pair_id from ``{stem}_volumes.csv`` unchanged.
-    """
     base = os.path.splitext(os.path.basename(neighbor_pairs_path))[0]
     for marker in ("_neighbors_3d", "_neighbors", "neighbors"):
         base = base.replace(marker, "")
@@ -921,11 +700,6 @@ def derive_output_stem(neighbor_pairs_path: str) -> str:
 
 
 def default_output_paths(neighbor_pairs_path: str, name_tag: str, output_dir=None):
-    """(csv, interscellar_zarr, cell_only_zarr) following the package naming convention.
-
-    ``name_tag`` separates the two pipelines: ``adaptive`` here, ``absolute`` for
-    ``compute_interscellar_volumes_3d``.
-    """
     stem = derive_output_stem(neighbor_pairs_path)
     directory = output_dir or (os.path.dirname(neighbor_pairs_path) or ".")
     prefix = f"{stem}_{name_tag}" if name_tag else stem
@@ -946,23 +720,7 @@ def export_pair_volumes(
     pad: int = 8,
     **kwargs: Any,
 ) -> Dict[str, Any]:
-    """Write one pair's interscellar and *pairwise* cell-only volumes for visualization.
 
-    The package's global cookie-cutter subtracts every pair's interscellar volume from
-    the segmentation at once. That is wrong for inspecting a single pair here, because
-    interscellar volumes overlap: cell A would come back pitted with holes carved by its
-    other partners, not by this pair.
-
-    So the subtraction is done pairwise -- cell A minus *this* pair's territory in A:
-
-        cell_only_A = A \ T_A(A,B)          cell_only_B = B \ T_B(A,B)
-
-    The corridor never enters either cell, so it plays no part in the subtraction.
-
-    Both volumes are cropped to the pair's own bounding box and share a shape, which is
-    all ``visualize_pair_3d`` requires. A one-row ``{stem}_volumes.csv`` is written beside
-    them so it can resolve the pair_id to cell IDs without a database.
-    """
     import csv as _csv
     import os as _os
     import zarr
