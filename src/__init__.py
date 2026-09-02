@@ -13,6 +13,7 @@ from .utils import (
     combine_cell_and_interscellar_volumes_3d,
     visualize_all_3d,
     visualize_pair_3d,
+    exclude_nuclei,
 )
 
 __all__ = [
@@ -25,4 +26,5 @@ __all__ = [
     "combine_cell_and_interscellar_volumes_3d",
     "visualize_all_3d",
     "visualize_pair_3d",
+    "exclude_nuclei",
 ]

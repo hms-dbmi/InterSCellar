@@ -20,7 +20,7 @@ from ..core.find_cell_neighbors_3d import(
 )
 from ..core.find_cell_neighbors_centroid_3d import create_neighbor_edge_table_database_centroid_3d
 
-from ..core.compute_interscellar_volumes_3d import(
+from ..core.compute_interscellar_volumes_3d_absolute import(
     build_interscellar_volume_database_from_neighbors,
     create_global_interscellar_mesh_zarr,
     create_global_cell_only_volumes_zarr,
@@ -312,6 +312,7 @@ def compute_interscellar_volumes_3d(
     return_connection: bool = False,
     intermediate_results_dir: str = "intermediate_interscellar_results",
     resume: Optional[bool] = None,
+    output_name_tag: str = "absolute",
 ) -> Tuple[Optional[pd.DataFrame], Optional[object], Optional[object]]:
     
     print("=" * 60)
@@ -335,16 +336,21 @@ def compute_interscellar_volumes_3d(
                 neighbor_db_path = alt_db
                 print(f"Detected neighbor_db_path: {neighbor_db_path}")
     
+    # Outputs are tagged to distinguish this pipeline from the adaptive one, which
+    # writes <stem>_adaptive_*. Inputs (neighbor graph db, surfaces/halo pickles) keep
+    # the untagged stem, so their auto-detection below is unaffected.
+    output_base_name = f"{csv_base_name}_{output_name_tag}" if output_name_tag else csv_base_name
+
     if db_path is None:
-        db_path = os.path.join(csv_dir, f"{csv_base_name}_interscellar_volumes.db")
+        db_path = os.path.join(csv_dir, f"{output_base_name}_interscellar_volumes.db")
         print(f"db_path: {db_path}")
     
     if output_csv is None:
-        output_csv = os.path.join(csv_dir, f"{csv_base_name}_volumes.csv")
+        output_csv = os.path.join(csv_dir, f"{output_base_name}_volumes.csv")
         print(f"output_csv: {output_csv}")
     
     if output_anndata is None:
-        output_anndata = os.path.join(csv_dir, f"{csv_base_name}_volumes.h5ad")
+        output_anndata = os.path.join(csv_dir, f"{output_base_name}_volumes.h5ad")
         print(f"output_anndata: {output_anndata}")
     
     if global_surface_pickle is None or halo_bboxes_pickle is None:
@@ -617,7 +623,7 @@ def compute_interscellar_volumes_3d(
     print(f"Cell-only volumes zarr: {output_cell_only_zarr}")
     
     try:
-        from ..core.compute_interscellar_volumes_3d import _cleanup_intermediate_results
+        from ..core.compute_interscellar_volumes_3d_absolute import _cleanup_intermediate_results
         _cleanup_intermediate_results(intermediate_results_dir)
     except Exception as e:
         print(f"Warning: Could not clean up intermediate results: {e}")
@@ -644,7 +650,7 @@ def compute_cell_only_volumes_3d(
     import os
     import zarr
     import numpy as np
-    from ..core.compute_interscellar_volumes_3d import create_global_cell_only_volumes_zarr
+    from ..core.compute_interscellar_volumes_3d_absolute import create_global_cell_only_volumes_zarr
     
     if output_zarr_path is None:
         interscellar_dir = os.path.dirname(interscellar_volumes_zarr) if os.path.dirname(interscellar_volumes_zarr) else "."

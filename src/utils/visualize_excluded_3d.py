@@ -105,7 +105,7 @@ def _write_label_zarr(
     )
     # Prefer the package's gzip helper when available (zarr v2/v3).
     try:
-        from ..core.compute_interscellar_volumes_3d import _zarr_gzip_dataset_kwargs
+        from ..core.compute_interscellar_volumes_3d_absolute import _zarr_gzip_dataset_kwargs
 
         comp_kwargs = _zarr_gzip_dataset_kwargs(level=6)
     except Exception:

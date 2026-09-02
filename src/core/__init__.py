@@ -36,7 +36,7 @@ from .find_cell_neighbors_centroid_3d import (
 )
 
 # 3D volume computation functions
-from .compute_interscellar_volumes_3d import (
+from .compute_interscellar_volumes_3d_absolute import (
     build_interscellar_volume_database_from_neighbors,
     create_global_interscellar_mesh_zarr,
     create_global_cell_only_volumes_zarr,
@@ -44,10 +44,6 @@ from .compute_interscellar_volumes_3d import (
     get_anndata_from_interscellar_database,
     export_interscellar_volumes_to_anndata,
     ANNDATA_AVAILABLE,
-)
-from .exclude_nuclei_from_interscellar import (
-    create_interscellar_nuclei_excluded_volumes_zarr,
-    exclude_nuclei_from_interscellar,
 )
 
 __all__ = [
@@ -88,8 +84,5 @@ __all__ = [
     "get_anndata_from_interscellar_database",
     "export_interscellar_volumes_to_anndata",
     "ANNDATA_AVAILABLE",
-    # Nuclei exclusion (standalone post-processing)
-    "create_interscellar_nuclei_excluded_volumes_zarr",
-    "exclude_nuclei_from_interscellar",
 ]
 
