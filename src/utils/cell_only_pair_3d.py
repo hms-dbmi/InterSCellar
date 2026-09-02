@@ -1,33 +1,3 @@
-"""Cell-only volume for a single neighboring pair.
-
-The global cookie cutter in ``compute_interscellar_volumes_3d_absolute`` subtracts the
-*union* of every pair's interscellar volume from the segmentation::
-
-    cell_only = where(interscellar > 0, 0, cells)
-
-That is correct for a whole-field view but wrong for inspecting one pair: cell A comes
-back pitted with holes carved by all of A's other partners, so what looks removed around
-pair A-B is mostly nothing to do with A-B.
-
-This script subtracts only the named pair::
-
-    cell_only = where(interscellar == pair_id, 0, cells)
-
-Voxels of cell A claimed by some *other* pair are left intact.
-
-Three output modes:
-
-- default: the full grid, so it matches the interscellar zarr it came from and can be
-  handed straight to ``visualize_pair_3d`` alongside that same zarr, but only the pair's
-  own region is populated. Cells elsewhere read as 0, which keeps the store small and is
-  all the pair viewer needs.
-- ``--write-whole-volume``: every cell everywhere, with just this pair removed. This is
-  the exact analogue of the global cookie cutter restricted to one pair. Slower and
-  larger.
-- ``--crop``: cropped to the pair's region. Needs a matching cropped interscellar volume,
-  since ``visualize_pair_3d`` requires both inputs to share a shape.
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -49,7 +19,6 @@ INTERSCELLAR_KEY_PREFERENCE = ["interscellar_meshes", "0", "labels"]
 
 
 def _create_array(store: Any, name: str, shape, dtype, chunks, fill_value=0):
-    """Create an array in a zarr group across zarr 2 and 3."""
     if hasattr(store, "create_array"):
         try:
             return store.create_array(
@@ -65,7 +34,6 @@ def _create_array(store: Any, name: str, shape, dtype, chunks, fill_value=0):
 def _open_label_array(
     zarr_path: str, dataset_key: Optional[str], preferred: List[str]
 ) -> Tuple[Any, Any, str]:
-    """Locate a 3D/5D label array without materializing it."""
     if not os.path.exists(zarr_path):
         raise FileNotFoundError(f"Zarr not found: {zarr_path}")
     root = zarr.open(zarr_path, mode="r")
@@ -116,7 +84,6 @@ def resolve_pair_cells(
     cell_a_id: Optional[int] = None,
     cell_b_id: Optional[int] = None,
 ) -> Tuple[Optional[int], Optional[int]]:
-    """Cell IDs for a pair: explicit values win, else a CSV lookup, else unknown."""
     if cell_a_id is not None and cell_b_id is not None:
         return int(cell_a_id), int(cell_b_id)
     if pairs_csv:
@@ -151,10 +118,6 @@ def compute_pair_cell_only(
     cell_key: Optional[str] = None,
     interscellar_key: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Subtract one pair's interscellar volume from the cell segmentation.
-
-    Writes a bundle that ``visualize_pair_3d`` can consume directly.
-    """
     stem = stem or f"pair{pair_id}"
     _, cell_node, cell_key_used = _open_label_array(
         cell_segmentation_zarr, cell_key, CELL_KEY_PREFERENCE
