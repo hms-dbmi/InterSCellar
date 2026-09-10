@@ -46,6 +46,24 @@ from .compute_interscellar_volumes_3d_absolute import (
     ANNDATA_AVAILABLE,
 )
 
+# 3D adaptive volume computation. The pair archive is the lossless record; read_pair
+# pulls one pair's complete footprint out of it without scanning the label volume.
+from .compute_interscellar_volumes_3d_adaptive import (
+    compute_interscellar_volume_adaptive,
+    compute_interscellar_volumes_adaptive_for_pairs,
+    PairVolumeArchive,
+    read_pair,
+    decode_component_mask,
+    COMPONENT_KEYS,
+    INTERFACE_KIND,
+)
+
+# 3D interscellar score computation
+from .calculate_interscellar_scores_3d import (
+    calculate_interscellar_scores_3d,
+    score_from_distance,
+)
+
 __all__ = [
     # 2D neighbor detection
     "build_global_mask_2d",
@@ -84,5 +102,16 @@ __all__ = [
     "get_anndata_from_interscellar_database",
     "export_interscellar_volumes_to_anndata",
     "ANNDATA_AVAILABLE",
+    # 3D adaptive volume computation
+    "compute_interscellar_volume_adaptive",
+    "compute_interscellar_volumes_adaptive_for_pairs",
+    "PairVolumeArchive",
+    "read_pair",
+    "decode_component_mask",
+    "COMPONENT_KEYS",
+    "INTERFACE_KIND",
+    # 3D interscellar score
+    "calculate_interscellar_scores_3d",
+    "score_from_distance",
 ]
 

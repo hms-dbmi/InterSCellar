@@ -51,6 +51,8 @@ dependencies = [
     "scikit-image>=0.18.0",
     "seaborn>=0.11.0",
     "napari>=0.4.0",
+    # Reading a Zarr v3 store needs zarr>=3, which in turn needs Python >=3.11.
+    # zarr 2 writes and reads v2 only; the pipeline emits whichever format is installed.
     "zarr>=2.10.0",
     "anndata>=0.8.0",
 ]
@@ -68,6 +70,7 @@ all = [
 ]
 
 [project.scripts]
+interscellar-score-3d = "interscellar.core.calculate_interscellar_scores_3d:main"
 feature-extract-3d = "interscellar.utils.feature_extraction_3d:main"
 combine-volumes-3d = "interscellar.utils.combine_volumes_3d:main"
 interscellar-centroids-3d = "interscellar.utils.interscellar_centroids_3d:main"
@@ -79,6 +82,7 @@ exclude-nuclei-from-interscellar = "interscellar.utils.exclude_nuclei:main"
 visualize-all-3d = "interscellar.utils.visualize_all_3d:main"
 visualize-excluded-3d = "interscellar.utils.visualize_excluded_3d:main"
 visualize-pair-3d = "interscellar.utils.visualize_pair_3d:main"
+visualize-pair-3d-adaptive = "interscellar.utils.visualize_pair_3d_adaptive:main"
 visualize-multi-3d = "interscellar.utils.visualize_multi_3d:main"
 
 [project.urls]

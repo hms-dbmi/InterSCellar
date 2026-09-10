@@ -747,3 +747,44 @@ def compute_cell_only_volumes_3d(
     print("=" * 60)
     
     return cell_only_df
+
+
+def calculate_interscellar_scores_3d(
+    interscellar_volumes_zarr: str,
+    spot_zarrs: Any,
+    biomarker: Optional[str] = None,
+    volumes_csv: Optional[str] = None,
+    output_csv: Optional[str] = None,
+    voxel_size_um: Optional[Tuple[float, float, float]] = None,
+    n_jobs: int = 1,
+    decay_power: float = 1.0,
+    block_mb: int = 128,
+    per_point_csv: Optional[str] = None,
+    overlap_qc: bool = True
+) -> pd.DataFrame:
+    print("=" * 60)
+    print("InterSCellar: Interscellar Score Computation - 3D")
+    print("=" * 60)
+
+    from ..core.calculate_interscellar_scores_3d import (
+        calculate_interscellar_scores_3d as _calculate_scores
+    )
+
+    written_csv = _calculate_scores(
+        interscellar_zarr=interscellar_volumes_zarr,
+        spot_zarrs=spot_zarrs,
+        biomarker=biomarker,
+        volumes_csv=volumes_csv,
+        output_csv=output_csv,
+        voxel_size_um=voxel_size_um,
+        n_jobs=n_jobs,
+        decay_power=decay_power,
+        block_mb=block_mb,
+        per_point_csv=per_point_csv,
+        overlap_qc=overlap_qc
+    )
+
+    scores_df = pd.read_csv(written_csv)
+    print("=" * 60)
+
+    return scores_df

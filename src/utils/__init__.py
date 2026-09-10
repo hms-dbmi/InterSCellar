@@ -10,6 +10,10 @@ from .interscellar_centroids_3d import (
 from .spot_count_3d import count_spots_per_volume_3d, main as spot_count_3d
 from .visualize_all_3d import main as visualize_all_3d
 from .visualize_pair_3d import main as visualize_pair_3d
+from .visualize_pair_3d_adaptive import (
+    load_pair_view,
+    main as visualize_pair_3d_adaptive,
+)
 from .cell_only_pair_3d import (
     compute_pair_cell_only,
     main as cell_only_pair_3d,
@@ -31,6 +35,8 @@ __all__ = [
     "spot_count_3d",
     "visualize_all_3d",
     "visualize_pair_3d",
+    "visualize_pair_3d_adaptive",
+    "load_pair_view",
     "compute_pair_cell_only",
     "cell_only_pair_3d",
     "exclude_nuclei",
