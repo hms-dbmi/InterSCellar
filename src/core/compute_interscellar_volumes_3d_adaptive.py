@@ -846,6 +846,16 @@ def _open_output_zarr(path, shape, appending, voxel_size_um, geometry, preview=T
     store.attrs["voxel_size_um"] = list(voxel_size_um)
     store.attrs["coordinate_system"] = "same_as_input_segmentation"
     store.attrs["axes"] = ["z", "y", "x"]
+    # Pair footprints are archived as crops, so without this the grid they are indexed
+    # in is only recoverable from the preview arrays -- which --preview none omits.
+    stored_shape = store.attrs.get("volume_shape_zyx")
+    if appending and stored_shape is not None and list(stored_shape) != [int(v) for v in shape]:
+        raise SystemExit(
+            f"Refusing to resume into {path}: it holds pairs indexed in a "
+            f"{list(stored_shape)} volume, but this run is on a {list(shape)} one. "
+            f"Use a new --out-zarr."
+        )
+    store.attrs["volume_shape_zyx"] = [int(v) for v in shape]
     if appending:
         stored = {k: store.attrs.get(k) for k in geometry if store.attrs.get(k) is not None}
         wanted = {k: v for k, v in geometry.items() if v is not None}
@@ -1798,6 +1808,7 @@ def main(argv=None) -> None:
         store.attrs["voxel_size_um"] = list(voxel_size_um)
         store.attrs["coordinate_system"] = "same_as_input_segmentation"
         store.attrs["axes"] = ["z", "y", "x"]
+        store.attrs["volume_shape_zyx"] = [int(v) for v in labels.shape]
         store.attrs.update({k: v for k, v in geometry.items() if v is not None})
         pct = 100.0 * shared / claimed if claimed else 0.0
         print(
