@@ -18,11 +18,6 @@ _WORKER_CTX: Dict[str, Any] = {}
 
 
 def stats(array):
-    """
-    Statistics on non-zero entries of ``array`` (masked intensities that are exactly 0 are dropped).
-
-    If every masked voxel is zero, returns NaNs so downstream CSV still gets a full row.
-    """
     arr = array[array != 0]
     if arr.size == 0:
         nan = float("nan")
@@ -241,9 +236,6 @@ def _read_raw_plane_czyx(
     labels_on_full_raw_grid: bool,
     z_origin: int,
 ) -> np.ndarray:
-    """
-    One analysis-grid Z plane as (C, Y, X), reading only the requested XY window from zarr.
-    """
     _, nd = _node_shape_ndim(raw_arr)
     factor = 2**downsample_level
     full_shape = _raw_node_to_czyx_shape(raw_arr)
@@ -289,11 +281,6 @@ def _gather_masked_intensities_zslab(
     raw_downsample_level: int,
     labels_on_full_raw_grid: bool,
 ) -> Tuple[int, List[np.ndarray]]:
-    """
-    Collect per-channel 1D masked intensities by visiting one (or factor) Z plane(s) at a time.
-
-    Peak memory is O(bbox XY × factor × C), not the full 3D tight bbox.
-    """
     z0, z1 = box["z0"], box["z1"]
     y0, y1 = box["y0"], box["y1"]
     x0, x1 = box["x0"], box["x1"]
@@ -378,7 +365,6 @@ def _chunk_keys_for_spatial_box(
     chunk_shape: Tuple[int, ...],
     label_ndim: int,
 ) -> List[str]:
-    """Zarr chunk keys (dot-separated indices) that intersect the spatial bbox."""
     if label_ndim == 5:
         starts = [0, 0, box["z0"], box["y0"], box["x0"]]
         ends = [1, 1, box["z1"], box["y1"], box["x1"]]
@@ -401,7 +387,6 @@ def _chunk_keys_for_spatial_box(
 
 
 def _block_reduce_mask_any(mask: np.ndarray, factor: int) -> np.ndarray:
-    """OR-pool a boolean 3D mask by non-overlapping factor×factor×factor blocks (pad with False)."""
     if factor <= 1:
         return mask
     if mask.ndim != 3:
@@ -571,15 +556,6 @@ def _pick_label_volume(
     raw_strided_level: int,
     expected_zyx: Tuple[int, int, int],
 ) -> Tuple[str, Any, bool]:
-    """
-    Pick a segmentation array compatible with the raw analysis grid.
-
-    Returns (key_path, array, labels_on_full_raw_grid).
-
-    Prefer labels whose (Z,Y,X) equals the effective (downsampled) raw shape. If that fails
-    but raw uses strided downsampling on a single full-res array, fall back to labels on the
-    **full** raw grid and OR-pool masks per 2^L block to align with strided intensities.
-    """
     try:
         name, node = _pick_label_array_matching_spatial(seg, expected_zyx)
         return name, node, False
@@ -603,13 +579,6 @@ def _pick_label_volume(
 
 
 def _resolve_raw_array(raw_zarr: Any, resolution_level: int) -> Tuple[str, Any, int]:
-    """
-    Returns (raw_zarr_key_path, array_node, strided_downsample_level).
-
-    ``strided_downsample_level`` is 0 when reading a native multiscale level array.
-    If the store is a single array and ``resolution_level > 0``, returns that array
-    with ``strided_downsample_level == resolution_level`` (same convention as feature_extraction_3d).
-    """
     candidates = _iter_raw_expression_candidates(raw_zarr)
     if not candidates:
         raise RuntimeError("Could not find any 3D+ raw expression arrays in the provided zarr store.")
@@ -657,35 +626,6 @@ def sub_volume_analysis(
     object_id_column: str = "pair_id",
     n_jobs: int = 1,
 ):
-    """
-    Per-object subvolume statistics: segmentation labels vs raw intensity at a chosen pyramid level.
-
-    The raw array at ``raw_resolution_level`` sets the analysis grid. Segmentation is chosen
-    to match that effective (Z, Y, X) when possible. If raw uses strided downsampling on a
-    single full-res array and labels only exist on the full grid, labels are matched to the
-    full raw shape and each object mask is block-OR pooled to the strided grid.
-
-    Parameters
-    ----------
-    segmentation_zarr:
-        Path to the segmentation OME-Zarr store.
-    raw_expression_zarr:
-        Path to the raw expression OME-Zarr store (multiscale keys inferred from path names).
-    output_csv:
-        CSV path for results and resume checkpoints.
-    raw_resolution_level:
-        Pyramid level index (0 = full resolution). For multiscale stores, the matching
-        array key must exist. For a single-array store, level > 0 uses strided downsampling
-        on that array (see feature_extraction_3d).
-    object_id_column:
-        Name of the ID column in the CSV.
-    n_jobs:
-        Process pool size for parallel objects.
-
-    Returns
-    -------
-    None; appends rows to ``output_csv``.
-    """
     seg_zarr = zarr.open(segmentation_zarr, mode="r")
     raw_zarr = zarr.open(raw_expression_zarr, mode="r")
     raw_key_path, data_raw, raw_strided_level = _resolve_raw_array(raw_zarr, raw_resolution_level)
