@@ -70,7 +70,7 @@ all = [
 ]
 
 [project.scripts]
-interscellar-score-3d = "interscellar.core.calculate_interscellar_scores_3d:main"
+interscellar-score-3d = "interscellar.core.calculate_interscellar_scores_3d_centrality:main"
 feature-extract-3d = "interscellar.utils.feature_extraction_3d:main"
 combine-volumes-3d = "interscellar.utils.combine_volumes_3d:main"
 interscellar-centroids-3d = "interscellar.utils.interscellar_centroids_3d:main"

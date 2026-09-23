@@ -59,7 +59,7 @@ from .compute_interscellar_volumes_3d_adaptive import (
 )
 
 # 3D interscellar score computation
-from .calculate_interscellar_scores_3d import (
+from .calculate_interscellar_scores_3d_centrality import (
     calculate_interscellar_scores_3d,
     score_from_distance,
 )

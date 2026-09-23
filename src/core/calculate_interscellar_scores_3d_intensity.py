@@ -655,7 +655,7 @@ def sub_volume_analysis(
     output_csv: str,
     raw_resolution_level: int = 0,
     object_id_column: str = "pair_id",
-    num_workers: int = 1,
+    n_jobs: int = 1,
 ):
     """
     Per-object subvolume statistics: segmentation labels vs raw intensity at a chosen pyramid level.
@@ -679,7 +679,7 @@ def sub_volume_analysis(
         on that array (see feature_extraction_3d).
     object_id_column:
         Name of the ID column in the CSV.
-    num_workers:
+    n_jobs:
         Process pool size for parallel objects.
 
     Returns
@@ -743,7 +743,7 @@ def sub_volume_analysis(
 
     # Keep raw/seg paths for worker init and resolve selected keys.
     seg_key_path = seg_key_used
-    workers = max(1, int(num_workers))
+    workers = max(1, int(n_jobs))
     print(f"Processing {total} objects with {workers} worker(s).")
 
     if workers == 1:
@@ -837,10 +837,10 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--num-workers",
+        "--n-jobs",
         type=int,
         default=1,
-        help="Number of worker processes for per-object computation (default: 1).",
+        help="Worker processes. Objects are distributed across them (default: 1).",
     )
     args = parser.parse_args()
 
@@ -877,7 +877,7 @@ def main() -> None:
         output_csv=output_csv,
         raw_resolution_level=args.raw_resolution_level,
         object_id_column=args.object_id_column,
-        num_workers=args.num_workers,
+        n_jobs=args.n_jobs,
     )
 
 

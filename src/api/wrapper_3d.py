@@ -762,84 +762,11 @@ def calculate_interscellar_scores_3d(
     pair_batch: int = 32,
     per_point_csv: Optional[str] = None
 ) -> pd.DataFrame:
-    """Score point-form biomarkers inside each interscellar volume, weighting every
-    spot by how far it sits from that pair's cell-cell interface.
-
-    Each nonzero voxel of a spot mask that falls inside a pair's interscellar volume
-    counts as one spot and carries the weight
-
-        w = (1 - d / D) ** decay_power,   clipped to [0, 1]
-
-    where d is the spot's Euclidean distance, in micrometers, from the nearest voxel of
-    that pair's interface, and D is the reference distance at which the weight reaches
-    zero. The interface is the pair's direct-contact surface when the two cells touch
-    and its facing surface patch when they do not; both are stored per pair by
-    compute_interscellar_volumes_3d. A spot lying on the interface therefore scores 1.0,
-    and one deeper than D scores 0.
-
-    Volumes are read from the lossless per-pair archive in the volumes zarr, one pair at
-    a time, so a spot voxel that belongs to several overlapping interscellar volumes is
-    scored independently in every one of them rather than being awarded to a single pair.
-    The archive is also the pair roster: every pair that produced a volume gets a row,
-    and no pair is filtered out here.
-
-    Args:
-        interscellar_volumes_zarr: Interscellar volumes zarr from
-            compute_interscellar_volumes_3d, containing the 'pair_volumes' archive of
-            per-pair footprints and interfaces.
-        spot_zarrs: Biomarker spot masks on the same voxel grid as the volumes. A single
-            path, a list of paths, a list of 'NAME=PATH' strings, or a {name: path}
-            mapping. One nonzero voxel is one spot, whatever its value.
-        biomarker: Name for a single spot mask given without a NAME= prefix.
-        volumes_csv: Optional per-pair volumes CSV from the volume step. Only used to
-            carry its volume figure across for comparison; the roster and the cell IDs
-            come from the archive.
-        output_csv: Output path. Defaults to
-            <zarr_dir>/<stem>_scores.csv.
-        voxel_size_um: Voxel size as (Z, Y, X) in micrometers. Defaults to the zarr's
-            OME-NGFF scale, then its voxel_size_um attribute, then (0.56, 0.28, 0.28).
-        n_jobs: Worker processes. Pairs are distributed across them.
-        decay_power: Exponent on the ramp. 1.0 is linear; values above 1 concentrate
-            weight near the interface.
-        reference_distance_um: The distance D above, in micrometers, or the string
-            'auto' to use the deepest interface distance measured in the data. Defaults
-            to the volume store's max_distance_um attribute, which is the corridor reach
-            the volumes were built with.
-        pair_batch: Pairs per work item handed to a worker.
-        per_point_csv: Optional path for a per-spot dump with columns pair_id,
-            biomarker, z, y, x, dist_um, weight.
-
-    Returns:
-        pandas.DataFrame in long format, one row per pair_id and biomarker. Alongside
-        the score columns (n_spots, score_sum, score_mean, score_per_um3,
-        mean_dist_um, median_dist_um, spots_beyond_reference) each row carries the
-        pair's geometry: voxel counts for the corridor, the two intracellular
-        territories and the two interface patches, the volume in um3, whether the
-        interface is 'direct' or 'near', how deep the volume reaches from its interface,
-        and how many of its voxels lie beyond D.
-
-    Note:
-        The score requires the lossless 'pair_volumes' archive. A dense pair-label zarr
-        cannot be scored, because it keeps only the highest pair_id on any shared voxel
-        and stores no interface; stores from the absolute pipeline fall in this category
-        and raise an explanatory error.
-
-        Because D fixes where the weight reaches zero, volume voxels further than D from
-        the interface contribute nothing. The default D is the corridor reach, which is
-        narrower than the intracellular territories, so deep territory voxels are often
-        clipped; the printed report gives the observed depth and the clipped fraction so
-        D can be raised deliberately. Scores are comparable between pairs only when they
-        share one D.
-
-        Spot voxels outside every interscellar volume are ignored, and the shared_voxels
-        column is -1 when the volume store was written without its overlap preview, which
-        is the only place that count is measured. Neither affects the scores.
-    """
     print("=" * 60)
     print("InterSCellar: Interscellar Score Computation - 3D")
     print("=" * 60)
 
-    from ..core.calculate_interscellar_scores_3d import (
+    from ..core.calculate_interscellar_scores_3d_centrality import (
         calculate_interscellar_scores_3d as _calculate_scores
     )
 
