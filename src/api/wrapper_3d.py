@@ -637,6 +637,95 @@ def compute_interscellar_volumes_3d(
         conn.close()
         return volume_results_df, adata, None
 
+def compute_interscellar_volumes_3d_adaptive(
+    ome_zarr_path: str,
+    neighbor_pairs_csv: str,
+    voxel_size_um: tuple = (0.56, 0.28, 0.28),
+    max_distance_um: float = 3.0,
+    surface_distance_um: float = 0.5,
+    rho_threshold: float = 0.5,
+    contact_rim_um: float = 0.0,
+    max_inward_um: Optional[float] = None,
+    output_csv: Optional[str] = None,
+    output_mesh_zarr: Optional[str] = None,
+    rejected_csv: Optional[str] = None,
+    output_dir: Optional[str] = None,
+    output_name_tag: str = "adaptive",
+    global_surface_pickle: Optional[str] = None,
+    halo_bboxes_pickle: Optional[str] = None,
+    exclude_truncated: bool = False,
+    reject_unbridged: bool = True,
+    preview: bool = True,
+    chunk_size: int = 500,
+    workers_load_volume: bool = False,
+    resume: bool = False,
+    n_jobs: int = 1
+) -> Optional[pd.DataFrame]:
+
+    print("=" * 60)
+    print("InterSCellar: Adaptive Volume Computation - 3D")
+    print("=" * 60)
+
+    from ..core.compute_interscellar_volumes_3d_adaptive import (
+        main as _adaptive_main,
+        default_output_paths
+    )
+
+    if output_csv is None:
+        output_csv = default_output_paths(neighbor_pairs_csv, output_name_tag, output_dir)[0]
+
+    z, y, x = voxel_size_um
+    argv = [
+        "--mask", ome_zarr_path,
+        "--pairs", neighbor_pairs_csv,
+        "--out", output_csv,
+        "--name-tag", output_name_tag,
+        "--max-distance-um", str(max_distance_um),
+        "--surface-distance-um", str(surface_distance_um),
+        "--rho-threshold", str(rho_threshold),
+        "--contact-rim-um", str(contact_rim_um),
+        "--z", str(z), "--y", str(y), "--x", str(x),
+        "--chunk-size", str(chunk_size),
+        "--preview", "both" if preview else "none",
+        "--n-jobs", str(n_jobs),
+    ]
+    optional = {
+        "--max-inward-um": max_inward_um,
+        "--out-zarr": output_mesh_zarr,
+        "--rejected-out": rejected_csv,
+        "--output-dir": output_dir,
+        "--global-surface": global_surface_pickle,
+        "--halo-bboxes": halo_bboxes_pickle,
+    }
+    for flag, value in optional.items():
+        if value is not None:
+            argv += [flag, str(value)]
+    flags = {
+        "--exclude-truncated": exclude_truncated,
+        "--no-reject-unbridged": not reject_unbridged,
+        "--workers-load-volume": workers_load_volume,
+        "--resume": resume,
+    }
+    argv += [flag for flag, enabled in flags.items() if enabled]
+
+    # The pipeline reports invalid inputs through argparse, which exits; surface that
+    # as an exception so a notebook or calling script is not terminated.
+    try:
+        _adaptive_main(argv)
+    except SystemExit as exc:
+        if exc.code not in (None, 0):
+            raise RuntimeError(
+                "Adaptive interscellar volume computation failed (see the error above)"
+            ) from None
+
+    volume_results_df = None
+    if os.path.exists(output_csv):
+        volume_results_df = pd.read_csv(output_csv)
+        print(f"Volume results table: {len(volume_results_df)} pairs")
+    print("=" * 60)
+
+    return volume_results_df
+
 def compute_cell_only_volumes_3d(
     ome_zarr_path: str,
     interscellar_volumes_zarr: str,
