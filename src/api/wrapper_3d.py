@@ -661,6 +661,53 @@ def compute_interscellar_volumes_3d_adaptive(
     resume: bool = False,
     n_jobs: int = 1
 ) -> Optional[pd.DataFrame]:
+    """Compute interscellar volumes with the adaptive pathway.
+
+    Each volume is the extracellular corridor between two neighboring cells plus the
+    intracellular rind reaching into each cell. Unlike compute_interscellar_volumes_3d,
+    which reaches a fixed distance into each cell, the adaptive pathway dilates inwards
+    from the cell surface by a depth ratio relative to the cell's maximum reach.
+
+    Args:
+        ome_zarr_path: 3D segmentation label volume (.zarr or .npy).
+        neighbor_pairs_csv: Neighbor pairs CSV or neighbor graph .db from
+            find_cell_neighbors_3d.
+        voxel_size_um: (z, y, x) voxel size in micrometers.
+        max_distance_um: Maximum surface-to-surface distance the corridor may span.
+        surface_distance_um: Distance from the surface that defines each cell's rim.
+        rho_threshold: Depth ratio, relative to the cell's maximum reach, that the
+            volume extends into each cell.
+        contact_rim_um: Extra rim width around direct-contact interfaces.
+        max_inward_um: Optional cap on how far the volume reaches into a cell.
+        output_csv: Per-pair volumes CSV. Defaults to <stem>_adaptive_volumes.csv.
+        output_mesh_zarr: Pair-labeled volumes zarr. Defaults to
+            <stem>_adaptive_interscellar_volumes.zarr.
+        rejected_csv: CSV of rejected pairs. Defaults to
+            <stem>_adaptive_rejected_pairs.csv.
+        output_dir: Directory for auto-named outputs. Defaults to the directory of
+            neighbor_pairs_csv.
+        output_name_tag: Tag inserted into auto-named outputs.
+        global_surface_pickle: Optional surfaces .pkl; must match the mask shape.
+        halo_bboxes_pickle: Optional halo bounding boxes .pkl; must lie inside the mask.
+        exclude_truncated: Skip pairs where either cell touches a face of the volume.
+        reject_unbridged: Reject pairs with no extracellular corridor reaching both
+            cells. Disable only for comparison.
+        preview: Write the dense interscellar_meshes/overlap_count arrays alongside the
+            lossless per-pair archive.
+        chunk_size: Pairs processed per chunk.
+        workers_load_volume: Each worker loads the whole volume instead of reading
+            pair crops lazily.
+        resume: Skip pairs already in output_csv and append to existing outputs.
+        n_jobs: Number of worker processes.
+
+    Returns:
+        DataFrame of per-pair volume measurements read back from output_csv.
+
+    Note:
+        Interscellar volumes may overlap; a voxel shared by several pairs belongs to
+        each of them in the per-pair archive, which calculate_interscellar_scores_3d
+        reads. The dense interscellar_meshes array can show only one pair per voxel.
+    """
 
     print("=" * 60)
     print("InterSCellar: Adaptive Volume Computation - 3D")

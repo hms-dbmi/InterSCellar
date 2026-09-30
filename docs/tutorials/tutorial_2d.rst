@@ -17,7 +17,7 @@ The 2D pipeline starts with detecting cell neighbors based on surface distance:
        metadata_csv_path="data/cell_metadata.csv",
        max_distance_um=1.0,
        pixel_size_um=0.1085,
-       n_jobs=4
+       n_jobs=8
    )
 
 Parameters
