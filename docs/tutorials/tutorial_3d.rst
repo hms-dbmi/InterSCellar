@@ -123,27 +123,39 @@ Outputs are written next to the neighbor pairs CSV as ``sample_adaptive_volumes.
 Cell-only volumes
 ^^^^^^^^^^^^^^^^^
 
-After computing interscellar volumes with either pathway, you can compute cell-only volumes by subtracting the interscellar volumes from the original segmentation:
+After computing interscellar volumes with either pathway, you can compute cell-only volumes by subtracting the interscellar volumes from the original segmentation. Every voxel that lies in any interscellar volume is removed from its cell, so a voxel shared by overlapping adaptive volumes is removed once:
 
 .. code-block:: python
 
    cellonly_3d = interscellar.compute_cell_only_volumes_3d(
        ome_zarr_path="data/segmentation.zarr",
-       interscellar_volumes_zarr="results/sample_adaptive_interscellar_volumes.zarr"
+       interscellar_volumes_zarr="results/sample_adaptive_interscellar_volumes.zarr",
+       n_jobs=8
    )
 
 **Parameters**
 
 * ``ome_zarr_path``: Path to original OME-Zarr file containing 3D segmentation
-* ``interscellar_volumes_zarr``: Path to interscellar volumes zarr file from step 2
+* ``interscellar_volumes_zarr``: Interscellar volumes zarr from either pathway of step 2
+* ``nuclei_segmentation_zarr`` (optional): Nuclei segmentation zarr on the same grid; every voxel inside a nucleus is also removed
+* ``n_jobs``: Number of parallel jobs
 
-The output zarr file is automatically saved in the same directory as the interscellar_volumes_zarr.
+The output zarr is saved next to the interscellar volumes zarr, with ``_interscellar_volumes`` replaced by ``_cell_only_volumes`` (e.g. ``sample_adaptive_cell_only_volumes.zarr``).
 
 **Output**
 
 The function returns:
 
-* ``cellonly_3d``: DataFrame with cell-only volume measurements
+* ``cellonly_3d``: DataFrame with one row per cell: ``cell_id``, ``cell_only_volume_voxels``, ``cell_only_volume_um3`` and ``cell_type``
+
+The same computation is available from the command line:
+
+.. code-block:: bash
+
+   compute-cell-only-volumes-3d \
+     --cell-segmentation-zarr "data/segmentation.zarr" \
+     --interscellar-zarr "results/sample_adaptive_interscellar_volumes.zarr" \
+     --n-jobs 8
 
 Step 3: Score
 -------------
@@ -186,3 +198,15 @@ Intensity statistics per volume are computed from a raw expression image:
      --segmentation-zarr "results/sample_adaptive_interscellar_volumes.zarr" \
      --raw-expression-zarr "data/raw_expression.zarr" \
      --n-jobs 8
+
+**Parameters**
+
+* ``--segmentation-zarr``: Interscellar volumes zarr from either pathway of step 2, or a cell-only volumes zarr
+* ``--raw-expression-zarr``: Raw expression OME-Zarr on the same voxel grid
+* ``--channels`` / ``--channel-names`` (optional): Channels to measure and names for them
+* ``--object-id-column`` (optional): ID column name; use ``cell_id`` for cell-only volumes
+* ``--n-jobs``: Number of parallel jobs
+
+**Output**
+
+A CSV with one row per volume and, for each channel, the ``sum``, ``mean``, ``std``, ``min``, ``max`` and ``nonzero_fraction`` of the raw intensities inside it. Statistics include every voxel of the volume, zero-intensity voxels too. Adaptive volumes are read from their lossless per-pair archive, so overlapping pairs each keep their shared voxels. By default the CSV is written next to the input as ``sample_adaptive_interscellar_volumes_features_3d.csv``.

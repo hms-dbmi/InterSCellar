@@ -777,83 +777,67 @@ def compute_cell_only_volumes_3d(
     ome_zarr_path: str,
     interscellar_volumes_zarr: str,
     output_zarr_path: Optional[str] = None,
-    neighbor_db_path: Optional[str] = None
+    neighbor_db_path: Optional[str] = None,
+    nuclei_segmentation_zarr: Optional[str] = None,
+    slab: int = 16,
+    n_jobs: int = 1
 ) -> pd.DataFrame:
+    """Compute cell-only volumes: each cell minus every interscellar volume.
+
+    A voxel keeps its cell label unless it lies in any interscellar volume, or, when
+    nuclei_segmentation_zarr is given, in any nucleus. Works with the output of either
+    pathway: an absolute store (label array '0') or an adaptive store (the
+    interscellar_meshes grid, or the lossless pair archive when the store was written
+    with preview=False). The volume is processed in Z-slabs, so memory stays at a few
+    slabs per worker regardless of dataset size.
+
+    Args:
+        ome_zarr_path: Cell segmentation zarr (cell IDs as labels).
+        interscellar_volumes_zarr: Interscellar volumes zarr from
+            compute_interscellar_volumes_3d or compute_interscellar_volumes_3d_adaptive.
+        output_zarr_path: Output zarr. Defaults to the interscellar zarr's name with
+            _interscellar_volumes replaced by _cell_only_volumes (plus _nuclei_excluded
+            when nuclei are given), in the same directory.
+        neighbor_db_path: Optional neighbor graph .db; supplies the cell_type column.
+        nuclei_segmentation_zarr: Optional nuclei segmentation zarr on the same grid;
+            every voxel inside a nucleus is also removed.
+        slab: Z slices processed at a time.
+        n_jobs: Number of worker processes, each handling one Z-slab at a time.
+
+    Returns:
+        DataFrame with one row per cell that keeps any voxels: cell_id,
+        cell_only_volume_voxels, cell_only_volume_um3 and cell_type.
+
+    Note:
+        Only the union of the interscellar volumes is subtracted, so overlapping
+        adaptive volumes remove each shared voxel once. Cells lying entirely inside
+        interscellar volumes (or nuclei) have no row. Volumes in um3 use the voxel size
+        recorded in the interscellar zarr, or (0.56, 0.28, 0.28) when it has none.
+    """
     print("=" * 60)
     print("InterSCellar: Cell-Only Volumes Computation - 3D")
     print("=" * 60)
-    
-    import os
-    import zarr
-    import numpy as np
-    from ..core.compute_interscellar_volumes_3d_absolute import create_global_cell_only_volumes_zarr
-    
-    if output_zarr_path is None:
-        interscellar_dir = os.path.dirname(interscellar_volumes_zarr) if os.path.dirname(interscellar_volumes_zarr) else "."
-        interscellar_basename = os.path.basename(interscellar_volumes_zarr)
-        base_name = os.path.splitext(interscellar_basename)[0]
-        
-        while base_name.endswith('_interscellar_volumes'):
-            base_name = base_name[:-len('_interscellar_volumes')]
-        
-        if not base_name.endswith('_cell_only_volumes'):
-            output_basename = base_name + '_cell_only_volumes.zarr'
-        else:
-            output_basename = base_name + '.zarr'
-        
-        output_zarr_path = os.path.join(interscellar_dir, output_basename)
-    
-    if not os.path.exists(ome_zarr_path):
-        raise FileNotFoundError(f"Cell segmentation zarr not found: {ome_zarr_path}")
-    if not os.path.exists(interscellar_volumes_zarr):
-        raise FileNotFoundError(f"Interscellar volumes zarr not found: {interscellar_volumes_zarr}")
-    
-    try:
-        interscellar_zarr = zarr.open(interscellar_volumes_zarr, mode='r')
-        if 'voxel_size_um' in interscellar_zarr.attrs:
-            voxel_size_um = tuple(interscellar_zarr.attrs['voxel_size_um'])
-            print(f"Detected voxel_size_um from interscellar zarr: {voxel_size_um}")
-        else:
-            voxel_size_um = (0.56, 0.28, 0.28)
-            print(f"Warning: voxel_size_um not found in zarr attributes, using default: {voxel_size_um}")
-        del interscellar_zarr
-    except Exception as e:
-        voxel_size_um = (0.56, 0.28, 0.28)
-        print(f"Warning: Could not read voxel_size_um from zarr, using default: {voxel_size_um} ({e})")
-    
-    print(f"\nInput files:")
-    print(f"Cell segmentation: {ome_zarr_path}")
-    print(f"Interscellar volumes: {interscellar_volumes_zarr}")
-    print(f"Output zarr: {output_zarr_path}")
-    
-    try:
-        cell_only_mask = create_global_cell_only_volumes_zarr(
-            original_segmentation_zarr=ome_zarr_path,
-            interscellar_volumes_zarr=interscellar_volumes_zarr,
-            output_zarr_path=output_zarr_path
-        )
-        print(f"Cell-only volumes zarr created: {output_zarr_path}")
-    except Exception as e:
-        print(f"\nError creating cell-only volumes zarr: {e}")
-        print("=" * 60)
-        raise
-    
-    print(f"\nComputing cell-only volume measurements...")
-    voxel_volume_um3 = np.prod(voxel_size_um)
-    
-    print(f"Computing volumes for all cells...")
-    unique_cells, counts = np.unique(cell_only_mask, return_counts=True)
 
-    mask = unique_cells > 0
-    unique_cells = unique_cells[mask]
-    counts = counts[mask]
-    
-    print(f"Found {len(unique_cells)} cells in cell-only volumes")
-    
+    from ..core.compute_cell_only_volumes_3d import compute_cell_only_volumes
+
+    summary = compute_cell_only_volumes(
+        cell_segmentation_zarr=ome_zarr_path,
+        interscellar_zarr=interscellar_volumes_zarr,
+        output_zarr_path=output_zarr_path,
+        slab=slab,
+        nuclei_segmentation_zarr=nuclei_segmentation_zarr,
+        n_jobs=n_jobs,
+    )
+
+    voxel_size_um = summary["voxel_size_um"]
+    if voxel_size_um is None:
+        voxel_size_um = (0.56, 0.28, 0.28)
+        print(f"Warning: voxel_size_um not found in the interscellar zarr, using default: {voxel_size_um}")
+    voxel_volume_um3 = float(np.prod(voxel_size_um))
+
     cell_types = {}
     if neighbor_db_path and os.path.exists(neighbor_db_path):
         try:
-            import sqlite3
             conn = sqlite3.connect(neighbor_db_path)
             try:
                 cells_df = pd.read_sql_query("SELECT cell_id, cell_type FROM cells", conn)
@@ -865,23 +849,23 @@ def compute_cell_only_volumes_3d(
                 conn.close()
         except Exception as e:
             print(f"Warning: Could not access neighbor database: {e}")
-    
-    volume_voxels_array = counts
-    volume_um3_array = volume_voxels_array * voxel_volume_um3
-    
+
+    remaining = summary["cell_voxels_after"]
+    cell_ids = np.asarray(sorted(remaining), dtype=np.int64)
+    voxels = np.asarray([remaining[c] for c in cell_ids.tolist()], dtype=np.int64)
     cell_only_df = pd.DataFrame({
-        'cell_id': unique_cells.astype(int),
-        'cell_only_volume_voxels': volume_voxels_array.astype(int),
-        'cell_only_volume_um3': volume_um3_array.astype(float),
-        'cell_type': [cell_types.get(int(cid), 'unknown') for cid in unique_cells]
+        'cell_id': cell_ids.astype(int),
+        'cell_only_volume_voxels': voxels.astype(int),
+        'cell_only_volume_um3': (voxels * voxel_volume_um3).astype(float),
+        'cell_type': [cell_types.get(int(cid), 'unknown') for cid in cell_ids],
     })
-    cell_only_df = cell_only_df.sort_values('cell_id').reset_index(drop=True)
-    
+
     print(f"Computed cell-only volumes for {len(cell_only_df)} cells")
-    print(f"Total cell-only volume: {cell_only_df['cell_only_volume_um3'].sum():.2f} μm³")
-    print(f"Mean cell-only volume: {cell_only_df['cell_only_volume_um3'].mean():.2f} μm³")
+    if len(cell_only_df):
+        print(f"Total cell-only volume: {cell_only_df['cell_only_volume_um3'].sum():.2f} μm³")
+        print(f"Mean cell-only volume: {cell_only_df['cell_only_volume_um3'].mean():.2f} μm³")
     print("=" * 60)
-    
+
     return cell_only_df
 
 
@@ -902,7 +886,7 @@ def calculate_interscellar_scores_3d(
     print("InterSCellar: Interscellar Score Computation - 3D")
     print("=" * 60)
 
-    from ..core.calculate_interscellar_scores_3d_centrality import (
+    from ..core.calculate_interscellar_scores_3d_point import (
         calculate_interscellar_scores_3d as _calculate_scores
     )
 

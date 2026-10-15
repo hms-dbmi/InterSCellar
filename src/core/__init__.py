@@ -58,8 +58,11 @@ from .compute_interscellar_volumes_3d_adaptive import (
     INTERFACE_KIND,
 )
 
+# 3D cell-only volumes (absolute and adaptive stores)
+from .compute_cell_only_volumes_3d import compute_cell_only_volumes
+
 # 3D interscellar score computation
-from .calculate_interscellar_scores_3d_centrality import (
+from .calculate_interscellar_scores_3d_point import (
     calculate_interscellar_scores_3d,
     score_from_distance,
 )
@@ -110,6 +113,8 @@ __all__ = [
     "decode_component_mask",
     "COMPONENT_KEYS",
     "INTERFACE_KIND",
+    # 3D cell-only volumes
+    "compute_cell_only_volumes",
     # 3D interscellar score
     "calculate_interscellar_scores_3d",
     "score_from_distance",

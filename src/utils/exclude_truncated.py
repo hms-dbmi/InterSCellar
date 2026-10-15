@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import zarr
 
-from .feature_extraction_3d import (
+from ..core.calculate_interscellar_scores_3d_intensity import (
     _find_zarr_store,
     _iter_segmentation_candidates,
     _read_label_slice_xy,

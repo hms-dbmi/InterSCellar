@@ -12,7 +12,7 @@ import zarr
 from tqdm import tqdm
 
 from .exclude_truncated import _pick_segmentation_label_array
-from .feature_extraction_3d import (
+from ..core.calculate_interscellar_scores_3d_intensity import (
     _find_zarr_store,
     _read_label_bbox_zyx,
     _to_spatial_shape_zyx,

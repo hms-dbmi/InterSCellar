@@ -1,4 +1,4 @@
-from .feature_extraction_3d import main as extract_features_3d
+from ..core.calculate_interscellar_scores_3d_intensity import main as extract_features_3d
 from .combine_volumes_3d import (
     combine_cell_and_interscellar_volumes_3d,
     main as combine_volumes_3d,

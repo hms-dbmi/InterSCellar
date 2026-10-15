@@ -69,10 +69,11 @@ volumes_3d = interscellar.compute_interscellar_volumes_3d_adaptive(
 
 *Cell-only volumes*
 ```sh
-# Cell segmentation with the interscellar volumes removed
+# Cell segmentation with the interscellar volumes removed (absolute or adaptive volumes)
 cellonly_3d = interscellar.compute_cell_only_volumes_3d(
     ome_zarr_path="data/segmentation.zarr",
-    interscellar_volumes_zarr="results/sample_adaptive_interscellar_volumes.zarr"
+    interscellar_volumes_zarr="results/sample_adaptive_interscellar_volumes.zarr",
+    n_jobs=8
 )
 ```
 
@@ -136,6 +137,15 @@ exclude-nuclei \
 
 **Volume Processing**
 ```sh
+# Cell-only volumes from the command line (optionally also removing nuclei)
+compute-cell-only-volumes-3d \
+  --cell-segmentation-zarr "data/segmentation.zarr" \
+  --interscellar-zarr "results/sample_adaptive_interscellar_volumes.zarr" \
+  --nuclei-segmentation-zarr "data/nuclei_segmentation.zarr" \
+  --n-jobs 8
+```
+
+```sh
 # Merge cell-only and interscellar volumes into one label zarr
 combine-volumes-3d \
   --cell-only-zarr "results/sample_adaptive_cell_only_volumes.zarr" \
@@ -157,14 +167,6 @@ cell-only-pair-3d \
 ```
 
 **Feature Extraction**
-```sh
-# Per-volume expression features
-feature-extract-3d \
-  --segmentation-zarr "results/sample_adaptive_interscellar_volumes.zarr" \
-  --raw-expression-zarr "data/raw_expression.zarr" \
-  --output-csv "results/features_3d.csv"
-```
-
 ```sh
 # Spot counts per volume from a spot coordinate CSV
 spot-count-3d \

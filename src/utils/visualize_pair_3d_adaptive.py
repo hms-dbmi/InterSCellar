@@ -129,6 +129,10 @@ def load_pair_view(
     show_overlapping: bool = False,
     show_other_cells: bool = False,
     verbose: bool = True,
+    show_nuclei: bool = False,
+    nuclei_path: Optional[str] = None,
+    show_removed: bool = False,
+    source_zarr: Optional[str] = None,
 ) -> Dict[str, Any]:
     store = _open_zarr_store(interscellar_zarr, "interscellar zarr")
     group = _archive_group(store)
@@ -209,6 +213,45 @@ def load_pair_view(
                 ("shared with other pairs", shared_any, "red")
             )
 
+    # Nuclei-excluded stores (written by exclude-nuclei) record their source store and
+    # nuclei mask, so both extra layers can find their inputs without being told.
+    nuclei_layers: List[Tuple[str, np.ndarray, str]] = []
+    if show_nuclei:
+        path = nuclei_path or store.attrs.get("nuclei_segmentation_zarr")
+        if not path:
+            raise SystemExit(
+                "--show-nuclei needs --nuclei: this store records no nuclei segmentation."
+            )
+        nuclei = _open_label_volume_lazy(path)
+        if nuclei is None:
+            nuclei = _load_label_volume(path)
+        if tuple(nuclei.shape) != volume_shape:
+            raise SystemExit(
+                f"Nuclei segmentation {path} has shape {tuple(nuclei.shape)}, but the "
+                f"interscellar store is {volume_shape}."
+            )
+        nuclei_layers.append(("nuclei", np.asarray(nuclei[window]) > 0, "gray"))
+
+    removed_layers: List[Tuple[str, np.ndarray, str]] = []
+    if show_removed:
+        path = source_zarr or store.attrs.get("source_zarr")
+        if not path:
+            raise SystemExit(
+                "--show-removed needs --source-zarr: this store records no source store."
+            )
+        source_store = _open_zarr_store(path, "source interscellar zarr")
+        _archive_group(source_store)
+        try:
+            original = read_pair(source_store, int(pair_id))
+        except KeyError as exc:
+            raise SystemExit(f"Pair {pair_id} is not in the source store {path}.") from exc
+        before = _place(original["mask"], original["origin_zyx"], window)
+        removed = before & ~_place(pair["mask"], origin, window)
+        removed_layers.append(("removed (vs source store)", removed, "red"))
+        if verbose:
+            print(f"  Source store: {path} ({int(before.sum())} voxels before, "
+                  f"{int(removed.sum())} removed)")
+
     # The default view is the whole footprint as one layer, matching visualize_pair_3d.
     # The per-component split stays available behind --split-components for when the
     # intracellular / extracellular breakdown is the question.
@@ -225,6 +268,8 @@ def load_pair_view(
         "interface_layers": interface_layers,
         "cell_layers": cell_layers,
         "overlap_layers": overlap_layers,
+        "nuclei_layers": nuclei_layers,
+        "removed_layers": removed_layers,
         "other_cells": other_cells,
         "sharers": sharers,
         "n_rows": n_rows,
@@ -271,7 +316,9 @@ def _report(view: Dict[str, Any], split: bool = False) -> None:
             rows += [(n, d, c, "") for n, d, c in reversed(view[group])]
     else:
         rows.append((*view["volume_layer"], ""))
+    rows += [(n, d, c, "") for n, d, c in view["removed_layers"]]
     rows += [(n, d, c, "") for n, d, c in reversed(view["cell_layers"])]
+    rows += [(n, d, c, "") for n, d, c in view["nuclei_layers"]]
     rows += [(n, d, c, "  (starts hidden)") for n, d, c in view["overlap_layers"]]
     for name, data, colour, note in rows:
         n = int(data.sum())
@@ -293,7 +340,8 @@ def _export(view: Dict[str, Any], path: str) -> None:
         "cell_b_id": np.asarray(pair["cell_b_id"]),
         "interface_kind": np.asarray(pair["interface_kind"]),
     }
-    for group_key in ("component_layers", "interface_layers", "cell_layers", "overlap_layers"):
+    for group_key in ("component_layers", "interface_layers", "cell_layers", "overlap_layers",
+                      "nuclei_layers", "removed_layers"):
         for name, data, _colour in view[group_key]:
             arrays[name.replace(" ", "_")] = data
     if view["other_cells"] is not None:
@@ -342,6 +390,8 @@ def _view_in_napari(view: Dict[str, Any], args) -> None:
             view["other_cells"].astype(np.uint32), name="other cells in crop",
             opacity=0.25, scale=scale, visible=False,
         )
+    for name, data, colour in view["nuclei_layers"]:
+        add(name, data, colour, args.cells_opacity)
     for name, data, colour in view["cell_layers"]:
         add(name, data, colour, args.cells_opacity)
 
@@ -356,6 +406,8 @@ def _view_in_napari(view: Dict[str, Any], args) -> None:
 
     for name, data, colour in view["overlap_layers"]:
         add(name, data, colour, 0.85, visible=False)
+    for name, data, colour in view["removed_layers"]:
+        add(name, data, colour, 0.85)
 
     # Open on the pair's busiest slice rather than slice 0, which is usually empty.
     if not args.view_3d:
@@ -397,6 +449,20 @@ def main(argv: Optional[List[str]] = None) -> None:
         "--show-other-cells", action="store_true",
         help="Add a faint layer of all other cell labels in the crop.",
     )
+    parser.add_argument(
+        "--show-nuclei", action="store_true",
+        help="Add a faint layer of the nuclei in the crop. Uses the nuclei segmentation "
+             "recorded by exclude-nuclei unless --nuclei is given.",
+    )
+    parser.add_argument("--nuclei", default=None, help="Nuclei segmentation zarr for --show-nuclei.")
+    parser.add_argument(
+        "--show-removed", action="store_true",
+        help="Add a layer of the voxels this pair lost relative to its source store, e.g. "
+             "the nuclei removed by exclude-nuclei. Uses the recorded source store unless "
+             "--source-zarr is given.",
+    )
+    parser.add_argument("--source-zarr", default=None,
+                        help="Store to compare against for --show-removed.")
     parser.add_argument(
         "--voxel-size-um", nargs=3, type=float, default=None, metavar=("Z", "Y", "X"),
         help="Override the store's voxel_size_um, used to scale the 3D view.",
@@ -471,6 +537,10 @@ def main(argv: Optional[List[str]] = None) -> None:
         voxel_size_um=tuple(args.voxel_size_um) if args.voxel_size_um else None,
         show_overlapping=args.show_overlapping,
         show_other_cells=args.show_other_cells,
+        show_nuclei=args.show_nuclei,
+        nuclei_path=args.nuclei,
+        show_removed=args.show_removed,
+        source_zarr=args.source_zarr,
     )
     _report(view, split=args.split_components)
 

@@ -20,7 +20,7 @@ except ImportError:
     print("Error: napari not installed. Install with: pip install 'napari[all]'")
     sys.exit(1)
 
-from .feature_extraction_3d import _find_zarr_store, _to_spatial_shape_zyx
+from ..core.calculate_interscellar_scores_3d_intensity import _find_zarr_store, _to_spatial_shape_zyx
 from .exclude_truncated import _pick_segmentation_label_array
 
 

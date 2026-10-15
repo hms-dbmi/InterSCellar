@@ -50,7 +50,8 @@ dependencies = [
     "matplotlib>=3.4.0",
     "scikit-image>=0.18.0",
     "seaborn>=0.11.0",
-    "napari>=0.4.0",
+    # napari needs a Qt binding to open a viewer; the bare package installs none.
+    "napari[pyqt5]>=0.4.0",
     # Reading a Zarr v3 store needs zarr>=3, which in turn needs Python >=3.11.
     # zarr 2 writes and reads v2 only; the pipeline emits whichever format is installed.
     "zarr>=2.10.0",
@@ -70,13 +71,14 @@ all = [
 ]
 
 [project.scripts]
-interscellar-score-3d = "interscellar.core.calculate_interscellar_scores_3d_centrality:main"
-feature-extract-3d = "interscellar.utils.feature_extraction_3d:main"
+interscellar-score-3d = "interscellar.core.calculate_interscellar_scores_3d_point:main"
+feature-extract-3d = "interscellar.core.calculate_interscellar_scores_3d_intensity:main"
 combine-volumes-3d = "interscellar.utils.combine_volumes_3d:main"
 interscellar-centroids-3d = "interscellar.utils.interscellar_centroids_3d:main"
 spot-count-3d = "interscellar.utils.spot_count_3d:main"
 exclude-truncated = "interscellar.utils.exclude_truncated:main"
 cell-only-pair-3d = "interscellar.utils.cell_only_pair_3d:main"
+compute-cell-only-volumes-3d = "interscellar.core.compute_cell_only_volumes_3d:main"
 exclude-nuclei = "interscellar.utils.exclude_nuclei:main"
 exclude-nuclei-from-interscellar = "interscellar.utils.exclude_nuclei:main"
 visualize-all-3d = "interscellar.utils.visualize_all_3d:main"

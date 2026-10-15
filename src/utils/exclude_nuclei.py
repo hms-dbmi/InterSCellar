@@ -257,6 +257,269 @@ def subtract_nuclei_from_volume(
     return result
 
 
+# Adaptive volume stores: per-pair archive
+
+_ARCHIVE_GROUP = "pair_volumes"
+_FOOTPRINT_KEYS = ("territory_a", "corridor", "territory_b")
+_INTERFACE_KEYS = ("interface_a", "interface_b")
+_COMPONENT_KEYS = _FOOTPRINT_KEYS + _INTERFACE_KEYS
+_COUNT_FIELDS = {
+    "territory_a": "n_territory_a", "corridor": "n_corridor", "territory_b": "n_territory_b",
+    "interface_a": "n_interface_a", "interface_b": "n_interface_b",
+}
+_PREVIEW_KEYS = ("interscellar_meshes", "overlap_count")
+
+
+def _has_pair_archive(root: Any) -> bool:
+    return hasattr(root, "keys") and _ARCHIVE_GROUP in root and "pair_id" in root[_ARCHIVE_GROUP]
+
+
+def _read_slab_3d(node: Any, z0: int, z1: int) -> np.ndarray:
+    if node.ndim == 5:
+        return np.asarray(node[0, 0, z0:z1])
+    return np.asarray(node[z0:z1])
+
+
+def _resized(group: Any, name: str, length: int) -> Any:
+    array = group[name]
+    result = array.resize((int(length),) + tuple(array.shape[1:]))
+    return group[name] if result is None else result
+
+
+def _copy_attrs(src: Any, dst: Any) -> None:
+    for key, value in src.attrs.items():
+        try:
+            dst.attrs[key] = value
+        except Exception as exc:
+            print(f"Warning: could not copy metadata key '{key}': {exc}")
+
+
+def _like(dst_group: Any, name: str, src: Any, shape) -> Any:
+    return _create_array(
+        dst_group, name, tuple(shape), src.dtype, src.chunks, 0,
+        **_zarr_gzip_dataset_kwargs(level=6, copy_compressors_from=src),
+    )
+
+
+def _pair_geometry(flat: np.ndarray, shape, origin, scale: np.ndarray):
+    # Same definitions as the adaptive pipeline's _mask_geometry.
+    if flat.size == 0:
+        return (np.nan,) * 3, (np.nan,) * 3, np.nan, np.nan
+    coords = np.stack(np.unravel_index(flat, shape), axis=1).astype(np.float64)
+    coords += np.asarray(origin, dtype=np.float64)
+    centroid = coords.mean(axis=0)
+    radii = np.sqrt((((coords - centroid) * scale) ** 2).sum(axis=1))
+    return tuple(centroid), tuple(centroid * scale), float(radii.min()), float(radii.max())
+
+
+def _exclude_nuclei_from_pair_archive(
+    input_zarr: str,
+    nuclei_segmentation_zarr: str,
+    output_zarr_path: str,
+    nuclei_key: Optional[str] = None,
+    batch_rows: int = 2048,
+) -> Dict[str, Any]:
+    from scipy.ndimage import label
+
+    root = zarr.open(input_zarr, mode="r")
+    group = root[_ARCHIVE_GROUP]
+    grid = next(
+        (tuple(int(v) for v in root[k].shape[-3:]) for k in _PREVIEW_KEYS if k in root), None
+    ) or tuple(int(v) for v in root.attrs["volume_shape_zyx"])
+    _, nuc_node, nuc_key_used = _find_label_array(nuclei_segmentation_zarr, nuclei_key)
+    if tuple(int(v) for v in nuc_node.shape[-3:]) != grid:
+        raise ValueError(
+            f"Shape mismatch: nuclei {tuple(nuc_node.shape[-3:])} (key '{nuc_key_used}') vs "
+            f"interscellar grid {grid}. Both must be on the same grid."
+        )
+    scale = np.asarray(root.attrs.get("voxel_size_um", (0.56, 0.28, 0.28)), dtype=np.float64)
+    stated = group.attrs.get("committed_rows")
+    n_rows = int(group["pair_id"].shape[0]) if stated is None else int(stated)
+    print("Excluding nuclei from every pair in the lossless pair archive")
+    print(f"  Input:  {input_zarr} ({n_rows} pairs, grid {grid})")
+    print(f"  Nuclei: {nuclei_segmentation_zarr} (key '{nuc_key_used}')")
+    print(f"  Output: {output_zarr_path}")
+
+    nuclei = np.zeros(grid, dtype=bool)
+    for z0 in range(0, grid[0], 16):
+        nuclei[z0:z0 + 16] = _read_slab_3d(nuc_node, z0, min(z0 + 16, grid[0])) > 0
+    # The overlap preview is unchanged at every voxel a pair keeps (nuclei are removed from
+    # all pairs alike), so it gives each pair's shared-voxel count after exclusion.
+    overlap = np.asarray(root["overlap_count"][...]) if "overlap_count" in root else None
+
+    out = zarr.open(output_zarr_path, mode="w")
+    _copy_attrs(root, out)
+    for key in _PREVIEW_KEYS:
+        if key not in root:
+            continue
+        src = root[key]
+        dst = _like(out, key, src, src.shape)
+        for z0 in range(0, grid[0], 16):
+            z1 = min(z0 + 16, grid[0])
+            dst[z0:z1] = np.where(nuclei[z0:z1], 0, np.asarray(src[z0:z1]))
+
+    rows = {
+        name: np.asarray(group[name][:n_rows])
+        for name in group.keys()
+        if name not in _COMPONENT_KEYS and not name.endswith("_indptr")
+    }
+    indptr = {name: np.asarray(group[f"{name}_indptr"][: n_rows + 1]).astype(np.int64)
+              for name in _COMPONENT_KEYS}
+    out_group = out.create_group(_ARCHIVE_GROUP)
+    out_data = {name: _like(out_group, name, group[name], group[name].shape)
+                for name in _COMPONENT_KEYS}
+    new_indptr = {name: np.zeros(n_rows + 1, dtype=np.uint64) for name in _COMPONENT_KEYS}
+    written = {name: 0 for name in _COMPONENT_KEYS}
+
+    updated = {
+        "n_voxels": np.zeros(n_rows, dtype=np.int64),
+        "n_components": np.zeros(n_rows, dtype=np.int64),
+        "shared_voxels": np.zeros(n_rows, dtype=np.int64),
+        "centroid_zyx_voxel": np.full((n_rows, 3), np.nan),
+        "centroid_zyx_um": np.full((n_rows, 3), np.nan),
+        "r_min_um": np.full(n_rows, np.nan),
+        "r_max_um": np.full(n_rows, np.nan),
+    }
+    updated.update({field: np.zeros(n_rows, dtype=np.int64) for field in _COUNT_FIELDS.values()})
+    removed_volume = removed_interface = 0
+    conn = np.ones((3, 3, 3), dtype=bool)
+
+    for r0 in range(0, n_rows, batch_rows):
+        r1 = min(r0 + batch_rows, n_rows)
+        block = {name: np.asarray(group[name][indptr[name][r0]:indptr[name][r1]])
+                 for name in _COMPONENT_KEYS}
+        kept_parts: Dict[str, List[np.ndarray]] = {name: [] for name in _COMPONENT_KEYS}
+        for row in range(r0, r1):
+            origin = rows["origin_zyx"][row]
+            shape = tuple(int(v) for v in rows["shape_zyx"][row])
+            crop = tuple(slice(int(origin[a]), int(origin[a]) + shape[a]) for a in range(3))
+            keep = ~nuclei[crop].ravel()
+            footprint = []
+            for name in _COMPONENT_KEYS:
+                lo = indptr[name][row] - indptr[name][r0]
+                hi = indptr[name][row + 1] - indptr[name][r0]
+                flat = np.cumsum(block[name][lo:hi], dtype=np.uint64)
+                kept = flat[keep[flat]]
+                if name in _FOOTPRINT_KEYS:
+                    removed_volume += int(flat.size - kept.size)
+                    footprint.append(kept)
+                else:
+                    removed_interface += int(flat.size - kept.size)
+                kept_parts[name].append(
+                    np.diff(kept, prepend=np.uint64(0)).astype(np.uint32, copy=False)
+                )
+                updated[_COUNT_FIELDS[name]][row] = kept.size
+            flat_fp = np.sort(np.concatenate(footprint))
+            updated["n_voxels"][row] = flat_fp.size
+            if flat_fp.size:
+                mask = np.zeros(int(np.prod(shape)), dtype=bool)
+                mask[flat_fp] = True
+                updated["n_components"][row] = label(mask.reshape(shape), structure=conn)[1]
+                if overlap is not None:
+                    updated["shared_voxels"][row] = int(
+                        (overlap[crop].ravel()[flat_fp] > 1).sum()
+                    )
+            c_vox, c_um, r_min, r_max = _pair_geometry(flat_fp, shape, origin, scale)
+            updated["centroid_zyx_voxel"][row] = c_vox
+            updated["centroid_zyx_um"][row] = c_um
+            updated["r_min_um"][row] = r_min
+            updated["r_max_um"][row] = r_max
+        for name in _COMPONENT_KEYS:
+            counts = np.asarray([p.size for p in kept_parts[name]], dtype=np.uint64)
+            start = written[name]
+            if counts.sum():
+                out_data[name][start:start + int(counts.sum())] = np.concatenate(kept_parts[name])
+            new_indptr[name][r0 + 1:r1 + 1] = start + np.cumsum(counts)
+            written[name] = start + int(counts.sum())
+        print(f"  pairs {r1}/{n_rows}", end="\r", flush=True)
+    print()
+
+    for name in _COMPONENT_KEYS:
+        _resized(out_group, name, written[name])
+        _like(out_group, f"{name}_indptr", group[f"{name}_indptr"], (n_rows + 1,))[:] = new_indptr[name]
+    rows["volume_um3"] = updated["n_voxels"] * float(np.prod(scale))
+    for name, values in updated.items():
+        if name in rows:
+            rows[name] = values
+    for name, values in rows.items():
+        src = group[name]
+        _like(out_group, name, src, (n_rows,) + tuple(src.shape[1:]))[:] = values.astype(src.dtype)
+
+    _copy_attrs(group, out_group)
+    out_group.attrs["committed_rows"] = n_rows
+    for name in _COMPONENT_KEYS:
+        out_group.attrs[f"committed_{name}"] = written[name]
+    out.attrs.update({
+        "subtracted_volumes": "nuclei_segmentation",
+        "nuclei_exclusion": (
+            "nucleus voxels removed from every component of every pair, interfaces "
+            "included; pairs are never dropped, so a pair may end up empty or split"
+        ),
+        "source_zarr": os.path.abspath(input_zarr),
+        "nuclei_segmentation_zarr": os.path.abspath(nuclei_segmentation_zarr),
+        "nuclei_segmentation_key": nuc_key_used,
+    })
+
+    before = np.asarray(group["n_voxels"][:n_rows]).astype(np.int64)
+    split = int(((updated["n_components"] > 1) & (np.asarray(group["n_components"][:n_rows]) <= 1)).sum())
+    summary = {
+        "pairs": n_rows,
+        "voxels_before": int(before.sum()),
+        "voxels_removed": removed_volume,
+        "interface_voxels_removed": removed_interface,
+        "pairs_emptied": int(((updated["n_voxels"] == 0) & (before > 0)).sum()),
+        "pairs_split": split,
+        "updated": updated,
+    }
+    print(f"  Pair voxels removed: {removed_volume:,} of {int(before.sum()):,} "
+          f"({removed_volume / max(1, int(before.sum())) * 100:.1f}%, shared voxels counted per pair)")
+    print(f"  Interface voxels removed: {removed_interface:,}")
+    print(f"  Pairs left empty: {summary['pairs_emptied']}; pairs newly split into "
+          f"several pieces: {split} (all pairs are kept)")
+    return summary
+
+
+def _write_nuclei_excluded_volumes_csv(input_zarr: str, output_zarr_path: str, summary: Dict[str, Any],
+                                       pair_ids: np.ndarray) -> Optional[str]:
+    stem_in = os.path.splitext(input_zarr.rstrip("/"))[0]
+    src_csv = stem_in + ".csv"
+    if not os.path.exists(src_csv):
+        return None
+    import pandas as pd
+
+    frame = pd.read_csv(src_csv)
+    u = summary["updated"]
+    new = pd.DataFrame({
+        "pair_id": pair_ids,
+        "total_interscellar_volume_voxels": u["n_voxels"],
+        "territory_a_voxels": u["n_territory_a"],
+        "corridor_voxels": u["n_corridor"],
+        "territory_b_voxels": u["n_territory_b"],
+        "n_interface_a": u["n_interface_a"],
+        "n_interface_b": u["n_interface_b"],
+        "n_components": u["n_components"],
+        "shared_voxels": u["shared_voxels"],
+        "r_min_um": u["r_min_um"],
+        "r_max_um": u["r_max_um"],
+    })
+    for i, axis in enumerate("zyx"):
+        new[f"centroid_{axis}_voxel"] = u["centroid_zyx_voxel"][:, i]
+        new[f"centroid_{axis}_um"] = u["centroid_zyx_um"][:, i]
+    new = new.set_index("pair_id")
+    frame = frame.set_index("pair_id")
+    common = [c for c in new.columns if c in frame.columns]
+    frame.loc[new.index, common] = new[common]
+    if "voxel_volume_um3" in frame.columns:
+        frame["total_interscellar_volume_um3"] = (
+            frame["total_interscellar_volume_voxels"] * frame["voxel_volume_um3"]
+        )
+    if "exclusive_voxels" in frame.columns:
+        frame["exclusive_voxels"] = frame["total_interscellar_volume_voxels"] - frame["shared_voxels"]
+    out_csv = os.path.splitext(output_zarr_path.rstrip("/"))[0] + ".csv"
+    frame.reset_index().to_csv(out_csv, index=False)
+    return out_csv
+
+
 def exclude_nuclei(
     input_zarr: str,
     nuclei_segmentation_zarr: str,
@@ -265,9 +528,31 @@ def exclude_nuclei(
     nuclei_key: Optional[str] = None,
     reference_zarr: Optional[str] = None,
 ):
-    """Subtract nuclei from any label zarr. Returns ``(result_array, output_path)``."""
+    """Subtract nuclei from any label zarr. Returns ``(result, output_path)``.
+
+    Adaptive interscellar stores (with a 'pair_volumes' archive) are carved pair by pair,
+    so overlapping volumes each keep their shared voxels; the result is then a summary
+    dict. Any other label zarr is carved as a single label volume and the result is the
+    carved array.
+    """
     if output_zarr_path is None:
         output_zarr_path = _default_output_path(input_zarr)
+
+    if input_key is None and _has_pair_archive(zarr.open(input_zarr, mode="r")):
+        print("=" * 60)
+        print("InterSCellar: Exclude nuclei from adaptive interscellar volumes")
+        print("=" * 60)
+        summary = _exclude_nuclei_from_pair_archive(
+            input_zarr, nuclei_segmentation_zarr, output_zarr_path, nuclei_key
+        )
+        pair_ids = np.asarray(zarr.open(output_zarr_path, mode="r")[_ARCHIVE_GROUP]["pair_id"][:])
+        out_csv = _write_nuclei_excluded_volumes_csv(
+            input_zarr, output_zarr_path, summary, pair_ids
+        )
+        if out_csv:
+            print(f"  Volumes CSV: {out_csv}")
+        print(f"\nWrote to: {output_zarr_path}")
+        return summary, output_zarr_path
 
     print("=" * 60)
     print("InterSCellar: Exclude nuclei from a label volume")
@@ -320,6 +605,9 @@ def main(argv: Optional[List[str]] = None) -> None:
             "subtraction. The input may be an interscellar volumes zarr, a cell "
             "segmentation, a cell-only volume, or any other label zarr: every voxel "
             "where the nuclei mask is > 0 is zeroed and all other labels are kept. "
+            "Adaptive interscellar stores (with a 'pair_volumes' archive) are carved pair "
+            "by pair in the same format, so overlapping volumes each keep their shared "
+            "voxels; per-pair counts, centroids and the volumes CSV are updated to match. "
             "Output is written next to the input by default."
         )
     )
