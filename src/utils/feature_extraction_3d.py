@@ -1,14 +1,26 @@
 import argparse
 import os
 import sys
+import time
 import unicodedata
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import pandas as pd
 import zarr
+
+# Adaptive volume stores keep every pair's full footprint here (lossless; overlapping pairs
+# each keep their shared voxels). The label grids next to it are previews only.
+_ARCHIVE_GROUP = "pair_volumes"
+_FOOTPRINT_KEYS = ("territory_a", "corridor", "territory_b")
+# Pairs are grouped by crop origin into tiles of this size; each tile's raw region is
+# read once and every pair in it is cut out of that block.
+_ARCHIVE_TILE_ZYX = (32, 256, 256)
+_STAT_NAMES = ("sum", "mean", "std", "min", "max", "nonzero_fraction")
+
+_ZARR_MAJOR = int(str(zarr.__version__).split(".")[0])
 
 
 def _zarr_child_keys(obj: Any) -> Optional[List[str]]:
@@ -19,6 +31,30 @@ def _zarr_child_keys(obj: Any) -> Optional[List[str]]:
         return list(keys_fn())
     except Exception:
         return None
+
+
+def _on_disk_zarr_format(path: str) -> Optional[int]:
+    if os.path.exists(os.path.join(path, "zarr.json")):
+        return 3
+    if os.path.exists(os.path.join(path, ".zgroup")) or os.path.exists(
+        os.path.join(path, ".zarray")
+    ):
+        return 2
+    return None
+
+
+def _open_store(path: str, what: str) -> Any:
+    try:
+        return zarr.open(path, mode="r")
+    except Exception as exc:
+        if _on_disk_zarr_format(path) == 3 and _ZARR_MAJOR < 3:
+            raise RuntimeError(
+                f"The {what} at {path} is a Zarr v3 store, but this environment has "
+                f"zarr {zarr.__version__}, which reads only v2. Run from an "
+                f"environment with zarr>=3 (which requires Python >=3.11); the store "
+                f"was most likely written by one."
+            ) from exc
+        raise
 
 
 def _normalize_cli_path(path_value: str) -> str:
@@ -136,6 +172,7 @@ def _read_raw_bbox_czyx(
     x0: int,
     x1: int,
     downsample_level: int = 0,
+    channels: Optional[Sequence[int]] = None,
 ) -> np.ndarray:
     _, nd = _node_shape_ndim(raw_arr)
     factor = 2 ** downsample_level
@@ -143,13 +180,19 @@ def _read_raw_bbox_czyx(
     fz0, fz1 = z0 * factor, min(z1 * factor, full_shape[1])
     fy0, fy1 = y0 * factor, min(y1 * factor, full_shape[2])
     fx0, fx1 = x0 * factor, min(x1 * factor, full_shape[3])
+    zyx = (slice(fz0, fz1, factor), slice(fy0, fy1, factor), slice(fx0, fx1, factor))
+    if channels is None:
+        channels = range(full_shape[0])
+    # One read per channel so unselected channels are never decompressed.
     if nd == 5:
-        return np.asarray(raw_arr[0, :, fz0:fz1:factor, fy0:fy1:factor, fx0:fx1:factor])
-    if nd == 4:
-        return np.asarray(raw_arr[:, fz0:fz1:factor, fy0:fy1:factor, fx0:fx1:factor])
-    if nd == 3:
-        return np.asarray(raw_arr[fz0:fz1:factor, fy0:fy1:factor, fx0:fx1:factor])[np.newaxis, ...]
-    raise ValueError(f"Raw expression array must be 3D/4D/5D. Got ndim={nd}")
+        planes = [np.asarray(raw_arr[(0, int(c)) + zyx]) for c in channels]
+    elif nd == 4:
+        planes = [np.asarray(raw_arr[(int(c),) + zyx]) for c in channels]
+    elif nd == 3:
+        planes = [np.asarray(raw_arr[zyx]) for _ in channels]
+    else:
+        raise ValueError(f"Raw expression array must be 3D/4D/5D. Got ndim={nd}")
+    return np.stack(planes)
 
 
 def _read_label_slice_xy(label_arr: Any, z_idx: int) -> np.ndarray:
@@ -488,37 +531,98 @@ def assert_spatial_compatible(
         print("  Axis metadata (informational): raw attrs:", raw_hints or "{}")
 
 
-def _safe_channel_names(n_channels: int, names_csv: Optional[str]) -> List[str]:
+def _store_channel_names(raw_root: Any, n_channels: int) -> Optional[List[str]]:
+    attrs = getattr(raw_root, "attrs", None)
+    if attrs is None:
+        return None
+    names = attrs.get("channel_names")
+    if names is None:
+        omero = attrs.get("omero") or {}
+        names = [ch.get("label") for ch in omero.get("channels", [])] or None
+    if names and len(names) == n_channels and all(names):
+        return [str(n) for n in names]
+    return None
+
+
+def _safe_channel_names(
+    n_channels: int, names_csv: Optional[str], raw_root: Any = None
+) -> List[str]:
     if names_csv is None:
+        stored = _store_channel_names(raw_root, n_channels)
+        if stored is not None:
+            return stored
         return [f"channel_{i}" for i in range(n_channels)]
     names = [x.strip() for x in names_csv.split(",") if x.strip()]
     if len(names) != n_channels:
         raise ValueError(
             f"--channel-names has {len(names)} names but raw data has {n_channels} channels."
         )
+    if len(set(names)) != len(names):
+        raise ValueError("--channel-names contains duplicate names.")
     return names
+
+
+def _select_channels(selection: Optional[str], channel_names: List[str]) -> List[int]:
+    if selection is None:
+        return list(range(len(channel_names)))
+    picked: List[int] = []
+    for token in [x.strip() for x in selection.split(",") if x.strip()]:
+        if token in channel_names:
+            index = channel_names.index(token)
+        elif token.isdigit() and int(token) < len(channel_names):
+            index = int(token)
+        else:
+            raise ValueError(
+                f"--channels entry '{token}' is neither a channel name nor a valid index. "
+                f"Channels: {channel_names}"
+            )
+        if index not in picked:
+            picked.append(index)
+    if not picked:
+        raise ValueError("--channels selected no channels.")
+    return picked
+
+
+def _channel_stats(values: np.ndarray, voxel_count: int) -> Tuple[float, ...]:
+    values = values.astype(np.float64, copy=False)
+    return (
+        float(values.sum()),
+        float(values.mean()),
+        float(values.std()),
+        float(values.min()),
+        float(values.max()),
+        float(np.count_nonzero(values) / voxel_count),
+    )
 
 
 def _scan_label_bounding_boxes(
     labels_arr: Any, include_background: bool
 ) -> Dict[int, Dict[str, int]]:
-    z_size, _, _ = _to_spatial_shape_zyx(labels_arr)
+    z_size, _, x_size = _to_spatial_shape_zyx(labels_arr)
     boxes: Dict[int, Dict[str, int]] = {}
     for z_idx in range(z_size):
-        label_slice = _read_label_slice_xy(labels_arr, z_idx)
-        present_labels = np.unique(label_slice)
-        if not include_background:
-            present_labels = present_labels[present_labels > 0]
-        for label_id in present_labels:
-            ys, xs = np.where(label_slice == label_id)
-            if ys.size == 0:
-                continue
-            lid = int(label_id)
-            y_min = int(ys.min())
-            y_max = int(ys.max()) + 1
-            x_min = int(xs.min())
-            x_max = int(xs.max()) + 1
-            if lid not in boxes:
+        flat = _read_label_slice_xy(labels_arr, z_idx).ravel()
+        pos = np.arange(flat.size) if include_background else np.flatnonzero(flat)
+        if pos.size == 0:
+            continue
+        # Sort the slice's voxels by label once, then reduce each label's run, instead of
+        # rescanning the whole slice for every label present in it.
+        labels = flat[pos]
+        order = np.argsort(labels, kind="stable")
+        labels = labels[order]
+        ys, xs = np.divmod(pos[order], x_size)
+        starts = np.flatnonzero(np.r_[True, labels[1:] != labels[:-1]])
+        per_label = zip(
+            labels[starts].tolist(),
+            np.minimum.reduceat(ys, starts).tolist(),
+            (np.maximum.reduceat(ys, starts) + 1).tolist(),
+            np.minimum.reduceat(xs, starts).tolist(),
+            (np.maximum.reduceat(xs, starts) + 1).tolist(),
+            np.diff(np.r_[starts, labels.size]).tolist(),
+        )
+        for lid, y_min, y_max, x_min, x_max, count in per_label:
+            box = boxes.get(lid)
+            if box is None:
                 boxes[lid] = {
                     "z0": z_idx,
                     "z1": z_idx + 1,
@@ -526,17 +630,15 @@ def _scan_label_bounding_boxes(
                     "y1": y_max,
                     "x0": x_min,
                     "x1": x_max,
-                    "voxel_count": int(ys.size),
+                    "voxel_count": count,
                 }
                 continue
-            box = boxes[lid]
-            box["z0"] = min(box["z0"], z_idx)
-            box["z1"] = max(box["z1"], z_idx + 1)
+            box["z1"] = z_idx + 1
             box["y0"] = min(box["y0"], y_min)
             box["y1"] = max(box["y1"], y_max)
             box["x0"] = min(box["x0"], x_min)
             box["x1"] = max(box["x1"], x_max)
-            box["voxel_count"] += int(ys.size)
+            box["voxel_count"] += count
     return boxes
 
 
@@ -545,7 +647,7 @@ def _compute_single_label_stats(
     box: Dict[str, int],
     labels_arr: Any,
     raw_arr: Any,
-    n_channels: int,
+    channels: Sequence[int],
     raw_downsample_level: int,
 ) -> Dict[str, Any]:
     z0, z1 = box["z0"], box["z1"]
@@ -558,7 +660,8 @@ def _compute_single_label_stats(
         raise RuntimeError(f"Object {label_id} had empty mask inside its own bounding box.")
 
     raw_bbox = _read_raw_bbox_czyx(
-        raw_arr, z0, z1, y0, y1, x0, x1, downsample_level=raw_downsample_level
+        raw_arr, z0, z1, y0, y1, x0, x1,
+        downsample_level=raw_downsample_level, channels=channels,
     )
     if raw_bbox.shape[1:] != labels_bbox.shape:
         raise RuntimeError(
@@ -570,14 +673,9 @@ def _compute_single_label_stats(
         "label_id": int(label_id),
         "voxel_count": voxel_count,
     }
-    for c in range(n_channels):
-        values = np.asarray(raw_bbox[c])[obj_mask].astype(np.float64, copy=False)
-        row[f"channel_{c}_sum"] = float(values.sum())
-        row[f"channel_{c}_mean"] = float(values.mean())
-        row[f"channel_{c}_std"] = float(values.std())
-        row[f"channel_{c}_min"] = float(values.min())
-        row[f"channel_{c}_max"] = float(values.max())
-        row[f"channel_{c}_nonzero_fraction"] = float(np.count_nonzero(values) / voxel_count)
+    for plane, c in zip(raw_bbox, channels):
+        for stat, value in zip(_STAT_NAMES, _channel_stats(plane[obj_mask], voxel_count)):
+            row[f"channel_{c}_{stat}"] = value
     return row
 
 
@@ -588,12 +686,14 @@ def _compute_features_chunked_parallel(
     object_id_column: str = "pair_id",
     num_workers: int = 4,
     raw_downsample_level: int = 0,
+    channels: Optional[Sequence[int]] = None,
 ) -> pd.DataFrame:
     boxes = _scan_label_bounding_boxes(labels_arr, include_background=include_background)
     if not boxes:
         raise ValueError("No labeled objects found (after background filtering).")
 
-    n_channels = _raw_node_to_czyx_shape(raw_arr)[0]
+    if channels is None:
+        channels = list(range(_raw_node_to_czyx_shape(raw_arr)[0]))
     label_ids = sorted(boxes.keys())
     results: List[Dict[str, Any]] = []
 
@@ -602,7 +702,7 @@ def _compute_features_chunked_parallel(
         for lid in label_ids:
             results.append(
                 _compute_single_label_stats(
-                    lid, boxes[lid], labels_arr, raw_arr, n_channels, raw_downsample_level
+                    lid, boxes[lid], labels_arr, raw_arr, channels, raw_downsample_level
                 )
             )
     else:
@@ -614,7 +714,7 @@ def _compute_features_chunked_parallel(
                     boxes[lid],
                     labels_arr,
                     raw_arr,
-                    n_channels,
+                    channels,
                     raw_downsample_level,
                 ): lid
                 for lid in label_ids
@@ -627,6 +727,212 @@ def _compute_features_chunked_parallel(
     return df.sort_values(object_id_column).reset_index(drop=True)
 
 
+# Pair archive mode (adaptive volume stores)
+
+def _has_pair_archive(seg_root: Any) -> bool:
+    keys = _zarr_child_keys(seg_root) or []
+    if _ARCHIVE_GROUP not in keys:
+        return False
+    return "pair_id" in (_zarr_child_keys(seg_root[_ARCHIVE_GROUP]) or [])
+
+
+def _archive_grid_shape(seg_root: Any) -> Tuple[int, int, int]:
+    keys = _zarr_child_keys(seg_root) or []
+    for key in ("interscellar_meshes", "overlap_count"):
+        if key in keys and hasattr(seg_root[key], "shape"):
+            return _to_spatial_shape_zyx(seg_root[key])
+    stated = seg_root.attrs.get("volume_shape_zyx")
+    if stated is not None and len(list(stated)) == 3:
+        return tuple(int(v) for v in stated)
+    raise ValueError(
+        "Could not determine the voxel grid of the pair archive: the store has no "
+        "'interscellar_meshes'/'overlap_count' array and no 'volume_shape_zyx' attribute."
+    )
+
+
+def _read_pair_table(group: Any) -> Dict[str, Any]:
+    on_disk = int(group["pair_id"].shape[0])
+    stated = group.attrs.get("committed_rows")
+    n_rows = on_disk if stated is None else max(0, min(int(stated), on_disk))
+    table: Dict[str, Any] = {"n_rows": n_rows}
+    for name in ("pair_id", "cell_a_id", "cell_b_id"):
+        table[name] = np.asarray(group[name][:n_rows]).astype(np.int64)
+    table["origin_zyx"] = np.asarray(group["origin_zyx"][:n_rows]).astype(np.int64)
+    table["shape_zyx"] = np.asarray(group["shape_zyx"][:n_rows]).astype(np.int64)
+    spans = []
+    for name in _FOOTPRINT_KEYS:
+        indptr = np.asarray(group[f"{name}_indptr"][: n_rows + 1]).astype(np.int64)
+        if indptr.size < n_rows + 1:
+            raise ValueError(
+                f"'{name}_indptr' holds {indptr.size} offsets but the archive commits "
+                f"{n_rows} rows; the store was written by an interrupted run."
+            )
+        spans.append(np.stack([indptr[:-1], indptr[1:]], axis=1))
+    table["spans"] = np.stack(spans, axis=1)  # (rows, component, [lo, hi])
+    return table
+
+
+def _decode_footprint(group: Any, spans: Sequence[Tuple[int, int]], shape: Tuple[int, int, int]) -> np.ndarray:
+    # Each component stores C-order flat indices within the pair's crop, delta-encoded.
+    mask = np.zeros(int(shape[0]) * int(shape[1]) * int(shape[2]), dtype=bool)
+    for name, (lo, hi) in zip(_FOOTPRINT_KEYS, spans):
+        if hi > lo:
+            deltas = np.asarray(group[name][int(lo):int(hi)])
+            mask[np.cumsum(deltas, dtype=np.uint64)] = True
+    return mask.reshape(tuple(int(v) for v in shape))
+
+
+def _plan_archive_tiles(table: Dict[str, Any], rows: np.ndarray) -> List[List[Tuple]]:
+    origins = table["origin_zyx"][rows]
+    tile_keys = origins // np.asarray(_ARCHIVE_TILE_ZYX, dtype=np.int64)
+    order = np.lexsort((tile_keys[:, 2], tile_keys[:, 1], tile_keys[:, 0]))
+    tiles: List[List[Tuple]] = []
+    previous = None
+    for i in order:
+        row = int(rows[i])
+        key = tuple(int(v) for v in tile_keys[i])
+        if key != previous:
+            tiles.append([])
+            previous = key
+        tiles[-1].append((
+            int(table["pair_id"][row]),
+            int(table["cell_a_id"][row]),
+            int(table["cell_b_id"][row]),
+            tuple(int(v) for v in table["origin_zyx"][row]),
+            tuple(int(v) for v in table["shape_zyx"][row]),
+            tuple((int(lo), int(hi)) for lo, hi in table["spans"][row]),
+        ))
+    return tiles
+
+
+_ARCHIVE_WORKER: Dict[str, Any] = {}
+
+
+def _init_archive_worker(
+    seg_path: str, raw_path: str, raw_key: str, raw_downsample_level: int, channels: List[int]
+) -> None:
+    seg_root = _open_store(seg_path, "segmentation zarr")
+    raw_root = _open_store(raw_path, "raw expression zarr")
+    _ARCHIVE_WORKER["group"] = seg_root[_ARCHIVE_GROUP]
+    _ARCHIVE_WORKER["raw"] = (
+        raw_root if raw_key.startswith("<root>") else _resolve_group_path(raw_root, raw_key)
+    )
+    _ARCHIVE_WORKER["level"] = int(raw_downsample_level)
+    _ARCHIVE_WORKER["channels"] = list(channels)
+
+
+def _process_archive_tile(pairs: List[Tuple]) -> List[List[Any]]:
+    group = _ARCHIVE_WORKER["group"]
+    channels = _ARCHIVE_WORKER["channels"]
+    origins = np.asarray([p[3] for p in pairs], dtype=np.int64)
+    ends = origins + np.asarray([p[4] for p in pairs], dtype=np.int64)
+    lo = origins.min(axis=0)
+    hi = ends.max(axis=0)
+    block = _read_raw_bbox_czyx(
+        _ARCHIVE_WORKER["raw"], int(lo[0]), int(hi[0]), int(lo[1]), int(hi[1]),
+        int(lo[2]), int(hi[2]), downsample_level=_ARCHIVE_WORKER["level"], channels=channels,
+    )
+    rows: List[List[Any]] = []
+    for (pair_id, cell_a, cell_b, origin, shape, spans), start, end in zip(pairs, origins, ends):
+        mask = _decode_footprint(group, spans, shape)
+        voxel_count = int(mask.sum())
+        row: List[Any] = [pair_id, cell_a, cell_b, voxel_count]
+        a, b = start - lo, end - lo
+        crop = block[:, a[0]:b[0], a[1]:b[1], a[2]:b[2]]
+        for plane in crop:
+            if voxel_count == 0:
+                row.extend([np.nan] * len(_STAT_NAMES))
+            else:
+                row.extend(_channel_stats(plane[mask], voxel_count))
+        rows.append(row)
+    return rows
+
+
+def _append_rows(path: str, rows: List[List[Any]], columns: List[str]) -> None:
+    write_header = not os.path.exists(path)
+    pd.DataFrame(rows, columns=columns).to_csv(path, mode="a", index=False, header=write_header)
+
+
+def _compute_features_from_archive(
+    seg_path: str,
+    raw_path: str,
+    raw_key: str,
+    raw_downsample_level: int,
+    channels: List[int],
+    channel_names: List[str],
+    output_csv: str,
+    object_id_column: str = "pair_id",
+    num_workers: int = 1,
+) -> pd.DataFrame:
+    group = _open_store(seg_path, "segmentation zarr")[_ARCHIVE_GROUP]
+    table = _read_pair_table(group)
+    columns = [object_id_column, "cell_a_id", "cell_b_id", "voxel_count"]
+    for c in channels:
+        columns.extend(f"{channel_names[c]}_{stat}" for stat in _STAT_NAMES)
+
+    done_ids: Set[int] = set()
+    if os.path.exists(output_csv):
+        existing = pd.read_csv(output_csv, nrows=0).columns.tolist()
+        if existing != columns:
+            raise ValueError(
+                f"{output_csv} exists with different columns (another channel selection or "
+                f"source?). Remove it or pass a different --output-csv.\n"
+                f"  existing: {existing}\n  expected: {columns}"
+            )
+        done_ids = set(pd.read_csv(output_csv, usecols=[object_id_column])[object_id_column]
+                       .astype(np.int64).tolist())
+    pending = np.flatnonzero(~np.isin(table["pair_id"], np.fromiter(done_ids, dtype=np.int64)))
+    tiles = _plan_archive_tiles(table, pending)
+
+    print(f"Pair archive: {table['n_rows']} pairs; {len(done_ids)} already in {output_csv}; "
+          f"{len(pending)} to compute in {len(tiles)} tiles of up to {_ARCHIVE_TILE_ZYX} "
+          f"(z, y, x) by crop origin.")
+    workers = max(1, int(num_workers))
+    init_args = (seg_path, raw_path, raw_key, raw_downsample_level, channels)
+    started = time.time()
+    finished_pairs = 0
+    last_report = 0.0
+
+    def _report(force: bool = False) -> None:
+        nonlocal last_report
+        now = time.time()
+        if not force and now - last_report < 5.0:
+            return
+        last_report = now
+        elapsed = max(now - started, 1e-9)
+        rate = finished_pairs / elapsed
+        left = (len(pending) - finished_pairs) / rate / 60.0 if rate > 0 else float("nan")
+        print(f"  {finished_pairs}/{len(pending)} pairs | {rate:.0f} pairs/s | "
+              f"~{left:.1f} min left", flush=True)
+
+    if tiles:
+        if workers == 1:
+            _init_archive_worker(*init_args)
+            for tile in tiles:
+                _append_rows(output_csv, _process_archive_tile(tile), columns)
+                finished_pairs += len(tile)
+                _report()
+        else:
+            with ProcessPoolExecutor(
+                max_workers=workers, initializer=_init_archive_worker, initargs=init_args
+            ) as pool:
+                futures = [pool.submit(_process_archive_tile, tile) for tile in tiles]
+                for future in as_completed(futures):
+                    rows = future.result()
+                    _append_rows(output_csv, rows, columns)
+                    finished_pairs += len(rows)
+                    _report()
+        _report(force=True)
+
+    df = pd.read_csv(output_csv)
+    df = df.sort_values(object_id_column).reset_index(drop=True)
+    # Rows were appended in completion order; rewrite once, sorted, when the run is complete.
+    tmp_path = output_csv + ".tmp"
+    df.to_csv(tmp_path, index=False)
+    os.replace(tmp_path, output_csv)
+    return df
+
+
 def _apply_channel_name_aliases(df: pd.DataFrame, channel_names: List[str]) -> pd.DataFrame:
     renamed = {}
     for idx, channel_name in enumerate(channel_names):
@@ -637,11 +943,14 @@ def _apply_channel_name_aliases(df: pd.DataFrame, channel_names: List[str]) -> p
     return df.rename(columns=renamed)
 
 
-def main() -> None:
+def main(argv: Optional[List[str]] = None) -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Extract per-object 3D expression features from a segmentation zarr "
             "(interscellar or cell-only) and a raw expression zarr. "
+            "Adaptive interscellar volume stores are read from their lossless "
+            "'pair_volumes' archive, so pairs that overlap each keep their shared voxels; "
+            "other stores are read as a label volume. "
             "The segmentation volume is chosen automatically so its (Z,Y,X) matches the raw data; "
             "dimensions must be compatible or the run fails with a clear error."
         )
@@ -673,12 +982,33 @@ def main() -> None:
     parser.add_argument(
         "--channel-names",
         default=None,
-        help="Optional comma-separated names for channels (must match channel count).",
+        help=(
+            "Optional comma-separated names for channels (must match channel count). "
+            "Defaults to the raw store's 'channel_names' or OME 'omero' labels when present."
+        ),
+    )
+    parser.add_argument(
+        "--channels",
+        default=None,
+        help=(
+            "Optional comma-separated channels to extract, by name or 0-based index "
+            "(e.g. PD1,PDL1). Only these channels are read. Default: all channels."
+        ),
+    )
+    parser.add_argument(
+        "--source",
+        choices=("auto", "archive", "labels"),
+        default="auto",
+        help=(
+            "Where object masks come from. 'archive' reads each pair's full footprint from "
+            "the adaptive store's 'pair_volumes' group; 'labels' reads one label volume "
+            "(absolute or cell-only stores). 'auto' (default) uses the archive when present."
+        ),
     )
     parser.add_argument(
         "--include-background",
         action="store_true",
-        help="Include label 0 as an object (off by default).",
+        help="Include label 0 as an object (off by default; label volumes only).",
     )
     parser.add_argument(
         "--object-id-column",
@@ -694,15 +1024,21 @@ def main() -> None:
     parser.add_argument(
         "--output-csv",
         default=None,
-        help="Output CSV path. Defaults to <segmentation_stem>_features_3d.csv",
+        help=(
+            "Output CSV path. Defaults to <segmentation_stem>_features_3d.csv. "
+            "In archive mode rows are appended as they finish and a rerun resumes."
+        ),
     )
     parser.add_argument(
         "--num-workers",
         type=int,
         default=1,
-        help="Number of parallel workers for per-object bbox feature extraction.",
+        help=(
+            "Number of parallel workers: processes over spatial tiles of pairs in archive "
+            "mode, threads over objects for label volumes."
+        ),
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     seg_path = _find_zarr_store(args.segmentation_zarr, script_dir)
@@ -723,19 +1059,32 @@ def main() -> None:
         output_csv = str(Path(seg_path).with_name(f"{stem}_features_3d.csv"))
 
     print("Opening zarr stores...")
-    seg_zarr = zarr.open(seg_path, mode="r")
-    raw_zarr = zarr.open(raw_path, mode="r")
+    seg_zarr = _open_store(seg_path, "segmentation zarr")
+    raw_zarr = _open_store(raw_path, "raw expression zarr")
 
-    seg_candidates = _iter_segmentation_candidates(seg_zarr)
-    if not seg_candidates:
-        gk = _zarr_child_keys(seg_zarr) or []
-        raise RuntimeError(f"No 3D+ arrays found in segmentation zarr. Keys: {gk}")
-    seg_spatial_shapes: List[Tuple[int, int, int]] = []
-    for _name, node in seg_candidates:
-        try:
-            seg_spatial_shapes.append(_to_spatial_shape_zyx(node))
-        except ValueError:
-            continue
+    has_archive = _has_pair_archive(seg_zarr)
+    if args.source == "archive" and not has_archive:
+        raise ValueError(
+            f"--source archive was requested but {seg_path} has no '{_ARCHIVE_GROUP}' group. "
+            f"Only stores written by compute_interscellar_volumes_3d_adaptive.py have one."
+        )
+    use_archive = has_archive and args.source != "labels"
+    if use_archive and args.include_background:
+        raise ValueError("--include-background applies to label volumes only, not the pair archive.")
+
+    if use_archive:
+        seg_spatial_shapes = [_archive_grid_shape(seg_zarr)]
+    else:
+        seg_candidates = _iter_segmentation_candidates(seg_zarr)
+        if not seg_candidates:
+            gk = _zarr_child_keys(seg_zarr) or []
+            raise RuntimeError(f"No 3D+ arrays found in segmentation zarr. Keys: {gk}")
+        seg_spatial_shapes = []
+        for _name, node in seg_candidates:
+            try:
+                seg_spatial_shapes.append(_to_spatial_shape_zyx(node))
+            except ValueError:
+                continue
 
     raw_key_used, raw_arr, raw_downsample_level = _select_expression_array_node_matching_segmentation(
         raw_zarr,
@@ -750,28 +1099,52 @@ def main() -> None:
     print(f"Raw expression level used: {raw_key_used}")
     print(f"Expected spatial grid (Z, Y, X): {expected_zyx}")
 
-    _seg_key_name, labels_arr = _pick_label_array_matching_spatial(seg_zarr, expected_zyx)
-    labels_shape_zyx = _to_spatial_shape_zyx(labels_arr)
+    channel_names = _safe_channel_names(raw_shape_czyx[0], args.channel_names, raw_zarr)
+    channels = _select_channels(args.channels, channel_names)
+    print(f"Channels: {[channel_names[c] for c in channels]}")
 
-    assert_spatial_compatible(
-        labels_shape_zyx, raw_shape_czyx, seg_path, raw_path, seg_zarr, raw_zarr
-    )
-
-    channel_names = _safe_channel_names(raw_shape_czyx[0], args.channel_names)
-    print(f"Labels shape (Z, Y, X): {labels_shape_zyx}")
-    print(f"Channels: {channel_names}")
-    print(f"Computing features with {max(1, args.num_workers)} worker(s)...")
-
-    features_df = _compute_features_chunked_parallel(
-        labels_arr=labels_arr,
-        raw_arr=raw_arr,
-        include_background=args.include_background,
-        object_id_column=args.object_id_column,
-        num_workers=max(1, args.num_workers),
-        raw_downsample_level=raw_downsample_level,
-    )
-    features_df = _apply_channel_name_aliases(features_df, channel_names)
-    features_df.to_csv(output_csv, index=False)
+    if use_archive:
+        grid_zyx = seg_spatial_shapes[0]
+        assert_spatial_compatible(grid_zyx, raw_shape_czyx, seg_path, raw_path, seg_zarr, raw_zarr)
+        print(f"Pair archive grid (Z, Y, X): {grid_zyx}")
+        print(f"Computing features with {max(1, args.num_workers)} worker process(es)...")
+        features_df = _compute_features_from_archive(
+            seg_path=seg_path,
+            raw_path=raw_path,
+            raw_key=raw_key_used,
+            raw_downsample_level=raw_downsample_level,
+            channels=channels,
+            channel_names=channel_names,
+            output_csv=output_csv,
+            object_id_column=args.object_id_column,
+            num_workers=max(1, args.num_workers),
+        )
+    else:
+        seg_key_name, labels_arr = _pick_label_array_matching_spatial(seg_zarr, expected_zyx)
+        labels_shape_zyx = _to_spatial_shape_zyx(labels_arr)
+        assert_spatial_compatible(
+            labels_shape_zyx, raw_shape_czyx, seg_path, raw_path, seg_zarr, raw_zarr
+        )
+        if has_archive or seg_key_name == "interscellar_meshes":
+            print(
+                f"Warning: '{seg_key_name}' holds one label per voxel, so where interscellar "
+                f"volumes overlap only the highest pair_id keeps the voxel and the other pairs' "
+                f"statistics are computed from reduced masks."
+                + (" Use --source archive for full per-pair masks." if has_archive else "")
+            )
+        print(f"Labels shape (Z, Y, X): {labels_shape_zyx}")
+        print(f"Computing features with {max(1, args.num_workers)} worker(s)...")
+        features_df = _compute_features_chunked_parallel(
+            labels_arr=labels_arr,
+            raw_arr=raw_arr,
+            include_background=args.include_background,
+            object_id_column=args.object_id_column,
+            num_workers=max(1, args.num_workers),
+            raw_downsample_level=raw_downsample_level,
+            channels=channels,
+        )
+        features_df = _apply_channel_name_aliases(features_df, channel_names)
+        features_df.to_csv(output_csv, index=False)
 
     print("Feature extraction completed.")
     print(f"Objects extracted: {len(features_df)}")
